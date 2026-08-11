@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -230,9 +229,10 @@ func currentDaemon() (daemonState, bool, error) {
 }
 
 func discoverLegacyDaemon() (daemonState, bool, error) {
-	if runtime.GOOS != "linux" {
-		return daemonState{}, false, nil
-	}
+	// Recover a running server that has no state file — e.g. its antares.pid was
+	// removed, or it was started by an older binary. Works on every platform
+	// that implements the process/port helpers; where they return nothing (an
+	// unsupported OS) this simply finds no daemon.
 	cfg, err := config.Load()
 	if err != nil {
 		return daemonState{}, false, err
