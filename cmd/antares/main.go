@@ -60,11 +60,13 @@ func run() error {
 		os.Exit(httpshim.Run(tool, rest))
 	}
 
-	// Bare `antares` opens the TUI when there is a terminal to draw on, and
-	// falls back to serving when there is not (systemd, Docker, cron).
-	command := "tui"
+	// Bare `antares` starts the background server, so the common case is a single
+	// word: type `antares` and it runs. `antares tui` opens the terminal UI, and
+	// `antares --foreground` runs the server attached (systemd, Docker, cron).
+	// When there is no terminal at all (a service manager), a bare invocation is
+	// treated as an explicit foreground serve rather than trying to daemonize.
+	command := "serve"
 	if len(args) == 0 && !term.IsTerminal(int(os.Stdin.Fd())) {
-		command = "serve"
 		args = []string{"--foreground"}
 	}
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -72,7 +74,7 @@ func run() error {
 	}
 
 	switch command {
-	case "serve", "start":
+	case "serve":
 		return cmdServe(args)
 	case "stop":
 		return cmdStop(args)
@@ -80,13 +82,8 @@ func run() error {
 		return cmdStatus(args)
 	case "_serve_foreground":
 		return cmdServeForeground()
-	case "tui", "chat-ui":
+	case "tui":
 		return cmdTUI()
-	case "chat", "repl", "cli":
-		if command == "repl" || command == "cli" {
-			args = append([]string{"-i"}, args...)
-		}
-		return cmdChat(args)
 	case "config":
 		return cmdConfig(args)
 	case "model":
@@ -125,16 +122,12 @@ func printUsage() {
 	fmt.Printf(`%s %s — AI agent
 
 Usage:
-  antares                  Open the terminal UI (serves the API when headless)
-  antares serve            Start the API server in the background
-  antares serve --foreground  Run attached to this terminal (debug/systemd)
-  antares stop             Stop the background API server
+  antares                  Start the API server + dashboard in the background
+  antares --foreground     Run attached to this terminal (debug/systemd/Docker)
+  antares stop             Stop the background server
   antares status           Show background server status
-  antares tui              Open the terminal UI explicitly
+  antares tui              Open the terminal UI
   antares setup            Configure Antares (web or terminal wizard)
-  antares chat <message>   Send one message and print the reply
-  antares chat -i          A plain line-based conversation (no full-screen UI)
-  antares repl             The same thing, spelled differently
   antares model [id]       Show, list, or change the active model
   antares model list       List every configured model
   antares provider         List providers and their connection status

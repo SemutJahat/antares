@@ -30,7 +30,7 @@ Wants=network-online.target
 Type=simple
 User=antares
 Environment=ANTARES_HOME=/var/lib/antares
-ExecStart=/opt/antares/antares serve
+ExecStart=/opt/antares/antares --foreground
 Restart=on-failure
 RestartSec=5
 

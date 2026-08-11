@@ -46,7 +46,7 @@ func cmdServe(args []string) error {
 		case "--background", "-d", "--daemon":
 			// Background is the default; retain explicit aliases for scripts.
 		case "--help", "-h":
-			fmt.Println("usage: antares serve [--foreground]")
+			fmt.Println("usage: antares [--foreground]")
 			return nil
 		default:
 			return fmt.Errorf("unknown serve option %q", arg)
@@ -59,9 +59,6 @@ func cmdServe(args []string) error {
 }
 
 func startDaemon() error {
-	if runtime.GOOS != "linux" {
-		return errors.New("background serve is currently implemented on Linux; use antares serve --foreground")
-	}
 	if err := config.EnsureHome(); err != nil {
 		return err
 	}

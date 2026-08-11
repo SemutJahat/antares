@@ -62,8 +62,8 @@ PATH. Open a **new** terminal afterwards. Pin a version with
 
 ```bash
 antares setup      # configure a provider (browser or terminal wizard)
-antares            # terminal UI
-antares serve      # API + dashboard on http://localhost:8787
+antares            # start API + dashboard in the background on http://localhost:8787
+antares tui        # open the terminal UI
 ```
 
 `antares setup` writes `~/.antares/config.yaml` (Windows:
