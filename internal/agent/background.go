@@ -157,6 +157,20 @@ func (a *Agent) signalBackgroundDone(id string) {
 // finishes. The server uses it to resume (or wake) the delegating session.
 func (a *Agent) OnBackgroundDone(cb func(BackgroundDone)) { a.onBgDone = cb }
 
+// TurnEnded is fired after a non-quiet top-level turn completes. A host uses it
+// to auto-continue a confident autonomous goal — start the next turn on its own.
+type TurnEnded struct {
+	SessionID string
+	Platform  string
+	// ChannelID/UserID let a gateway deliver the continued turn to the right
+	// place (empty on the web/CLI).
+	ChannelID string
+	UserID    string
+}
+
+// OnTurnEnd registers the callback invoked when a top-level turn finishes.
+func (a *Agent) OnTurnEnd(cb func(TurnEnded)) { a.onTurnEnd = cb }
+
 // continueTask sends a follow-up to a finished task, running another turn on the
 // same sub-session so the coordinator can iterate with a worker. It runs
 // synchronously and returns the new reply.

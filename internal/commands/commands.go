@@ -79,6 +79,11 @@ type Input struct {
 	// SessionID is the conversation the command was typed in, when there is one.
 	SessionID string
 	Surface   Surface
+	// Platform and ChannelID identify a messaging-gateway origin (e.g. discord,
+	// telegram), so a command that starts unattended work — an autonomous goal —
+	// can record where to deliver its results. Empty for web and the CLI.
+	Platform  string
+	ChannelID string
 }
 
 type entry struct {

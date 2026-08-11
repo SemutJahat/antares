@@ -191,6 +191,10 @@ type Agent struct {
 	// resume the delegating session with the result rather than the agent
 	// polling for it. Nil until the server registers it.
 	onBgDone func(BackgroundDone)
+	// onTurnEnd is fired when a non-quiet top-level turn finishes, so a host can
+	// decide to auto-continue a confident autonomous goal without the user
+	// sending anything. Nil until a host (server / cmd) registers it.
+	onTurnEnd func(TurnEnded)
 
 	mu     sync.Mutex
 	active map[string]context.CancelFunc
@@ -679,7 +683,33 @@ func (a *Agent) Run(ctx context.Context, req Request, emit Emit) (*Result, error
 	}
 	_ = emit(Event{Type: EventDone})
 
+	// Confident autonomous goal: if this top-level turn ended with the goal still
+	// unmet and not paused, ask the host to start the next turn on its own. The
+	// host owns turn-starting (and the no-overlap queue), so the agent only
+	// signals. Skip when a background task is running — that path resumes via
+	// OnBackgroundDone instead, and continuing here would double-drive.
+	if !req.Quiet && req.Depth == 0 &&
+		a.onTurnEnd != nil && !a.bg.hasRunning(sess.ID) {
+		if a.ShouldAutoContinueGoal(ctx, sess.ID) {
+			a.onTurnEnd(TurnEnded{
+				SessionID: sess.ID, Platform: req.Platform,
+				ChannelID: req.ChannelID, UserID: req.UserID,
+			})
+		}
+	}
+
 	return &Result{SessionID: sess.ID, Reply: lastReply, Turns: turn, Usage: total}, nil
+}
+
+// ShouldAutoContinueGoal reports whether the session has a confident autonomous
+// goal that is still running (not done, not paused) and so should drive another
+// turn on its own.
+func (a *Agent) ShouldAutoContinueGoal(ctx context.Context, sessionID string) bool {
+	g, ok := a.GetGoal(ctx, sessionID)
+	if !ok {
+		return false
+	}
+	return g.Autonomous && !g.Done && !g.Paused
 }
 
 // validateToolCallArguments catches provider streams that finish with a

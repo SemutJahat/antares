@@ -106,6 +106,44 @@ At the cap the goal pauses rather than stopping, so `/goal resume` continues fro
 where it got to. If no judge model is available, the loop ends rather than
 running forever.
 
+### Confident (autonomous) goals
+
+A normal goal advances one judge step per turn and then waits for you. A
+**confident** goal does not wait: it keeps starting its own turns and works
+towards the goal unattended until it is met — across the web dashboard, the
+gateways, and even a server restart.
+
+```
+/goal auto <what you want done>       confident, default cap
+/goal auto <n> <what you want done>   confident, cap at n iterations
+/goal auto 0 <what you want done>     confident, no cap — runs until met
+/goal auto on | off                   flip an existing goal in or out of the mode
+```
+
+It is opt-in because it spends tokens on its own. Every iteration prints a
+visible notice, so you always see it working.
+
+**Smarter when stuck.** If the judge asks for the same next step again — no
+progress — the goal escalates its tactics instead of repeating a failing step:
+
+1. change approach — a different command, tool, or angle;
+2. gather information first — read the documentation, search the web or a
+   tutorial for the exact error or task, then apply what it learns;
+3. change strategy — delegate a focused research sub-agent, or break the goal
+   into a smaller step it can complete now.
+
+**Bounds.** It stops on its own only when the goal is met, the cap is reached
+(then it pauses, resumable), or it hits something **only you** can resolve — a
+missing secret, an ambiguous requirement, an irreversible choice. In that last
+case it pauses and says exactly what it needs, rather than looping on the
+impossible. A hard technical problem is not a blocker: it keeps trying. Stop it
+any time with `/goal pause` or `/goal clear`.
+
+```yaml
+agent:
+  goal_autonomous_max_iterations: 50   # default cap for /goal auto; a per-goal 0 means unlimited
+```
+
 ## Learning
 
 `/learn` turns what just happened into a skill.
@@ -194,7 +232,8 @@ Bare `/rollback` only lists. Undoing work takes a second word.
 | `agent.repeat_limit` | 3 | Identical calls before the nudge |
 | `agent.verify_replies` | off | Check answers against the request |
 | `agent.verify_max` | 2 | How many times a turn can be sent back |
-| `agent.goal_max_iterations` | 10 | Iterations before a goal pauses |
+| `agent.goal_max_iterations` | 10 | Iterations before a normal goal pauses |
+| `agent.goal_autonomous_max_iterations` | 50 | Default cap for a `/goal auto` goal (per-goal 0 = unlimited) |
 | `agent.max_turns` | 200 | Hard ceiling on model calls per run |
 | `tools.max_tool_calls_per_turn` | 32 | Tool budget before the model is told to wrap up |
 

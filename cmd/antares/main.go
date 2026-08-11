@@ -337,7 +337,7 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 	// A slash command is answered here rather than being sent to the model, so
 	// /status in Telegram means what it means in the terminal.
 	if name, args, ok := commands.Parse(msg.Text); ok {
-		return rt.runGatewayCommand(ctx, key, sessionID, name, args)
+		return rt.runGatewayCommand(ctx, key, sessionID, name, args, msg.Platform, msg.ChannelID)
 	}
 
 	// Per-channel routing. Bindings gate GROUP/server channels: when a platform
@@ -448,12 +448,14 @@ func (rt *runtimeServices) messageIsRelevant(ctx context.Context, b *config.Bind
 // runGatewayCommand answers a slash command typed in a chat platform. The few
 // commands that only a screen can carry out are translated into something a
 // message thread can actually do.
-func (rt *runtimeServices) runGatewayCommand(ctx context.Context, kvKey, sessionID, name, args string) (string, error) {
+func (rt *runtimeServices) runGatewayCommand(ctx context.Context, kvKey, sessionID, name, args, platform, channelID string) (string, error) {
 	res, err := commands.Run(ctx, rt.commandDeps(), commands.Input{
 		Name:      name,
 		Args:      args,
 		SessionID: sessionID,
 		Surface:   commands.SurfaceGateway,
+		Platform:  platform,
+		ChannelID: channelID,
 	})
 	if err != nil {
 		return err.Error(), nil

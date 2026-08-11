@@ -108,8 +108,13 @@ func New(o Options) *Server {
 	// instead of the main agent polling for them.
 	if s.agent != nil {
 		s.agent.OnBackgroundDone(s.onBackgroundDone)
+		// A confident autonomous goal drives its own next turn when one ends.
+		s.agent.OnTurnEnd(s.onTurnEnd)
 	}
 	s.routes()
+	// Resume any confident autonomous goals left running from before a restart,
+	// so an unattended goal survives the server going down and coming back.
+	s.resumeAutonomousGoals()
 	return s
 }
 
