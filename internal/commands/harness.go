@@ -128,7 +128,10 @@ func cmdGoalAuto(ctx context.Context, d Deps, in Input, rest string) (Result, er
 		if err := d.Agent.SetGoal(ctx, in.SessionID, g); err != nil {
 			return Result{}, err
 		}
-		return Result{Output: "Goal is now autonomous. I will keep working on it on my own until it is met."}, nil
+		return Result{
+			Output: "Goal is now autonomous. I will keep working on it on my own until it is met.",
+			Action: Action{Kind: "goal_autostart"},
+		}, nil
 	case "off":
 		g, ok := d.Agent.GetGoal(ctx, in.SessionID)
 		if !ok {
@@ -177,10 +180,15 @@ func cmdGoalAuto(ctx context.Context, d Deps, in Input, rest string) (Result, er
 	case cap > 0:
 		capMsg = fmt.Sprintf("a cap of %d iterations", cap)
 	}
-	return Result{Output: fmt.Sprintf(
-		"Confident goal set with %s. I will keep working on it across turns on my own — "+
-			"trying different approaches (docs, web, sub-agents) if I get stuck — until it is met. "+
-			"Pause with `/goal pause`, stop with `/goal clear`.\n\n%s", capMsg, text)}, nil
+	return Result{
+		Output: fmt.Sprintf(
+			"Confident goal set with %s. I will keep working on it across turns on my own — "+
+				"trying different approaches (docs, web, sub-agents) if I get stuck — until it is met. "+
+				"Pause with `/goal pause`, stop with `/goal clear`.\n\n%s", capMsg, text),
+		// Tell the host to start the first turn now; without this the loop would
+		// only begin after some other turn happened to run.
+		Action: Action{Kind: "goal_autostart"},
+	}, nil
 }
 
 // cmdSteer redirects a run that is already in flight. The note is delivered

@@ -712,6 +712,18 @@ func (a *Agent) ShouldAutoContinueGoal(ctx context.Context, sessionID string) bo
 	return g.Autonomous && !g.Done && !g.Paused
 }
 
+// KickAutonomousGoal starts the first turn of a just-set confident goal by
+// firing the registered turn-end driver, so `/goal auto` begins working
+// immediately instead of only after some later turn. It is a no-op when no host
+// registered a driver or the goal is not an active autonomous one. Platform and
+// channelID let a gateway-set goal deliver its turns back to the right chat.
+func (a *Agent) KickAutonomousGoal(ctx context.Context, sessionID, platform, channelID string) {
+	if a.onTurnEnd == nil || !a.ShouldAutoContinueGoal(ctx, sessionID) {
+		return
+	}
+	a.onTurnEnd(TurnEnded{SessionID: sessionID, Platform: platform, ChannelID: channelID})
+}
+
 // validateToolCallArguments catches provider streams that finish with a
 // truncated JSON argument payload. Without this check the malformed call reaches
 // the tool, fails Bind with unexpected EOF, and consumes the turn instead of

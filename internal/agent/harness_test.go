@@ -7,6 +7,7 @@ import (
 
 	"github.com/enowdev/antares/internal/config"
 	"github.com/enowdev/antares/internal/llm"
+	"github.com/enowdev/antares/internal/store"
 )
 
 func TestRepeatTrackerTripsOnIdenticalCalls(t *testing.T) {
@@ -208,5 +209,46 @@ func TestAutonomousMaxUsesGoalThenConfigDefault(t *testing.T) {
 	}
 	if got := a.autonomousMax(&Goal{Max: 0}); got != 50 {
 		t.Errorf("Max 0 falls back to config default (unlimited is decided by the caller), got %d", got)
+	}
+}
+
+func TestKickAutonomousGoalFiresDriver(t *testing.T) {
+	db, err := store.Open(context.Background(), "memory", "", 1, 5000, false)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	a := New(config.Default(), db, nil, nil, nil)
+
+	var fired []TurnEnded
+	a.OnTurnEnd(func(e TurnEnded) { fired = append(fired, e) })
+
+	ctx := context.Background()
+	// Autonomous goal -> kick fires with the session/platform/channel.
+	if err := a.SetGoal(ctx, "s1", &Goal{Text: "win", Autonomous: true}); err != nil {
+		t.Fatal(err)
+	}
+	a.KickAutonomousGoal(ctx, "s1", "discord", "c9")
+	if len(fired) != 1 || fired[0].SessionID != "s1" || fired[0].Platform != "discord" || fired[0].ChannelID != "c9" {
+		t.Fatalf("expected one kick for s1/discord/c9, got %+v", fired)
+	}
+
+	// A paused goal must not kick.
+	fired = nil
+	if err := a.SetGoal(ctx, "s2", &Goal{Text: "x", Autonomous: true, Paused: true}); err != nil {
+		t.Fatal(err)
+	}
+	a.KickAutonomousGoal(ctx, "s2", "web", "")
+	if len(fired) != 0 {
+		t.Fatalf("paused goal should not kick, got %+v", fired)
+	}
+
+	// A normal (non-autonomous) goal must not kick.
+	if err := a.SetGoal(ctx, "s3", &Goal{Text: "y"}); err != nil {
+		t.Fatal(err)
+	}
+	a.KickAutonomousGoal(ctx, "s3", "web", "")
+	if len(fired) != 0 {
+		t.Fatalf("non-autonomous goal should not kick, got %+v", fired)
 	}
 }

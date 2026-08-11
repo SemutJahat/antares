@@ -464,6 +464,10 @@ func (rt *runtimeServices) runGatewayCommand(ctx context.Context, kvKey, session
 			rt.agent.Interrupt(sessionID)
 		}
 		return "Stopped.", nil
+	case "goal_autostart":
+		// A confident goal set from chat must begin working now; its turns are
+		// delivered back to this channel.
+		rt.agent.KickAutonomousGoal(ctx, sessionID, platform, channelID)
 	}
 	if res.Output == "" {
 		return "Done.", nil
