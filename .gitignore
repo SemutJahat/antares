@@ -2,6 +2,9 @@
 bin/
 .air/
 *.test
+# A cross-compile run drops the binary in the repo root; it once got committed.
+antares
+antares.exe
 
 # Node
 node_modules/
