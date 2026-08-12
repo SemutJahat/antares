@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/enowdev/antares/internal/agent"
@@ -31,7 +32,8 @@ func cmdGoal(ctx context.Context, d Deps, in Input) (Result, error) {
 	case "", "status":
 		g, ok := d.Agent.GetGoal(ctx, in.SessionID)
 		if !ok {
-			return Result{Output: "No standing goal. Set one with `/goal <what you want done>`."}, nil
+			return Result{Output: "No standing goal. Set one with `/goal <what you want done>`, " +
+				"or `/goal auto <what you want done>` for a confident goal that keeps working on its own."}, nil
 		}
 		state := "running"
 		switch {
@@ -40,7 +42,22 @@ func cmdGoal(ctx context.Context, d Deps, in Input) (Result, error) {
 		case g.Paused:
 			state = "paused"
 		}
-		out := fmt.Sprintf("**Goal** (%s, %d iteration(s))\n\n%s", state, g.Iterations, g.Text)
+		mode := "normal"
+		if g.Autonomous {
+			mode = "autonomous"
+		}
+		out := fmt.Sprintf("**Goal** (%s · %s · %d iteration(s))\n\n%s", state, mode, g.Iterations, g.Text)
+		if g.Autonomous {
+			cap := "unlimited"
+			if g.Max > 0 {
+				cap = fmt.Sprintf("%d", g.Max)
+			}
+			out += fmt.Sprintf("\n\n_autonomous cap: %s", cap)
+			if g.StuckCount > 0 {
+				out += fmt.Sprintf(" · stuck level %d", g.StuckCount)
+			}
+			out += "_"
+		}
 		if g.Note != "" {
 			out += "\n\n_" + g.Note + "_"
 		}
@@ -69,16 +86,21 @@ func cmdGoal(ctx context.Context, d Deps, in Input) (Result, error) {
 			return Result{}, errors.New("there is no goal to resume")
 		}
 		g.Paused, g.Done, g.Note = false, false, ""
+		// Resuming clears the stuck counter so escalation starts fresh.
+		g.StuckCount, g.LastNext = 0, ""
 		if err := d.Agent.SetGoal(ctx, in.SessionID, g); err != nil {
 			return Result{}, err
 		}
 		return Result{Output: "Goal resumed."}, nil
+
+	case "auto":
+		return cmdGoalAuto(ctx, d, in, rest)
 	}
 
-	// Anything else is the goal itself.
+	// Anything else is the goal itself (normal mode).
 	text := strings.TrimSpace(in.Args)
 	if text == "" {
-		return Result{}, errors.New("usage: /goal <what you want done>")
+		return Result{}, errors.New("usage: /goal <what you want done>  (or `/goal auto <...>` for a confident goal)")
 	}
 	g := &agent.Goal{Text: text}
 	if err := d.Agent.SetGoal(ctx, in.SessionID, g); err != nil {
@@ -86,6 +108,87 @@ func cmdGoal(ctx context.Context, d Deps, in Input) (Result, error) {
 	}
 	return Result{Output: "Goal set. I will keep working on it across turns until it is met, " +
 		"or you run `/goal clear`.\n\n" + text}, nil
+}
+
+// cmdGoalAuto handles `/goal auto ...`: the confident mode that iterates across
+// turns on its own. Forms:
+//
+//	/goal auto <text>        confident goal, default cap
+//	/goal auto <n> <text>    confident goal, cap n iterations (0 = unlimited)
+//	/goal auto on            turn an existing goal autonomous
+//	/goal auto off           turn it back to normal
+func cmdGoalAuto(ctx context.Context, d Deps, in Input, rest string) (Result, error) {
+	switch strings.ToLower(strings.TrimSpace(rest)) {
+	case "on":
+		g, ok := d.Agent.GetGoal(ctx, in.SessionID)
+		if !ok {
+			return Result{}, errors.New("no goal to make autonomous — set one with `/goal auto <what you want done>`")
+		}
+		g.Autonomous, g.Paused, g.Done, g.Note = true, false, false, ""
+		if err := d.Agent.SetGoal(ctx, in.SessionID, g); err != nil {
+			return Result{}, err
+		}
+		return Result{
+			Output: "Goal is now autonomous. I will keep working on it on my own until it is met.",
+			Action: Action{Kind: "goal_autostart"},
+		}, nil
+	case "off":
+		g, ok := d.Agent.GetGoal(ctx, in.SessionID)
+		if !ok {
+			return Result{}, errors.New("there is no goal")
+		}
+		g.Autonomous = false
+		if err := d.Agent.SetGoal(ctx, in.SessionID, g); err != nil {
+			return Result{}, err
+		}
+		return Result{Output: "Autonomous mode off. The goal stays, but it waits for you between turns."}, nil
+	}
+
+	// Optional leading integer is the iteration cap (0 = unlimited).
+	cap := -1 // -1 means "not specified → use the configured default"
+	text := strings.TrimSpace(rest)
+	if first, remainder, found := strings.Cut(text, " "); found {
+		if n, err := strconv.Atoi(first); err == nil && n >= 0 {
+			cap = n
+			text = strings.TrimSpace(remainder)
+		}
+	} else if n, err := strconv.Atoi(text); err == nil && n >= 0 {
+		// `/goal auto 0` with no text: just a bare number, invalid on its own.
+		_ = n
+		return Result{}, errors.New("usage: /goal auto [n] <what you want done>  (n is the iteration cap, 0 = unlimited)")
+	}
+	if text == "" {
+		return Result{}, errors.New("usage: /goal auto [n] <what you want done>  (n is the iteration cap, 0 = unlimited)")
+	}
+
+	g := &agent.Goal{
+		Text:       text,
+		Autonomous: true,
+		Platform:   in.Platform,
+		ChannelID:  in.ChannelID,
+	}
+	if cap >= 0 {
+		g.Max = cap // 0 here means unlimited for an autonomous goal
+	}
+	if err := d.Agent.SetGoal(ctx, in.SessionID, g); err != nil {
+		return Result{}, err
+	}
+	capMsg := "the default cap"
+	switch {
+	case cap == 0:
+		capMsg = "no cap (unlimited)"
+	case cap > 0:
+		capMsg = fmt.Sprintf("a cap of %d iterations", cap)
+	}
+	return Result{
+		Output: fmt.Sprintf(
+			"Confident goal set with %s. I will keep working on it across turns on my own — "+
+				"trying different approaches (docs, web, sub-agents) if I get stuck — until it is met. "+
+				"Pause with `/goal pause`, stop with `/goal clear`.\n\n%s", capMsg, text),
+		// Tell the host to start the first turn now; without this the loop would
+		// only begin after some other turn happened to run.
+		Action: Action{Kind: "goal_autostart"},
+	}, nil
 }
 
 // cmdSteer redirects a run that is already in flight. The note is delivered

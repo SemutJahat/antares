@@ -420,8 +420,8 @@ func runTerminalSetup(ctx context.Context, rt *runtimeServices) error {
 	fmt.Printf("  Saved to %s\n", config.ConfigFile())
 	fmt.Println()
 	fmt.Println("  " + bold("Next"))
-	fmt.Println("    antares          start chatting in the terminal")
-	fmt.Printf("    antares serve    dashboard on http://localhost:%d\n", cfg.Server.Port)
+	fmt.Printf("    antares          start the server + dashboard on http://localhost:%d\n", cfg.Server.Port)
+	fmt.Println("    antares tui      chat in the terminal UI")
 	fmt.Println()
 	return nil
 }

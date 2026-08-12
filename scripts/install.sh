@@ -146,4 +146,4 @@ case ":$PATH:" in
 esac
 
 echo
-info "next: run 'antares setup' to configure a provider, then 'antares' or 'antares serve'"
+info "next: run 'antares setup' to configure a provider, then 'antares' to start it in the background (or 'antares tui' for the terminal UI)"

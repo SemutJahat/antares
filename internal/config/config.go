@@ -179,6 +179,14 @@ type Agent struct {
 	VerifyMax int `yaml:"verify_max" json:"verify_max"`
 	// GoalMaxIterations bounds a standing goal so it cannot run forever.
 	GoalMaxIterations int `yaml:"goal_max_iterations" json:"goal_max_iterations"`
+	// GoalAutonomousMaxIterations is the default iteration cap for a "confident"
+	// autonomous goal (`/goal auto`), which keeps working across turns on its
+	// own. It is separate from — and normally higher than — GoalMaxIterations
+	// because an autonomous goal is expected to run much longer unattended. A
+	// per-goal cap of 0 means unlimited; this default only applies when the goal
+	// did not set its own. At the cap the goal pauses (resumable), it does not
+	// stop.
+	GoalAutonomousMaxIterations int `yaml:"goal_autonomous_max_iterations" json:"goal_autonomous_max_iterations"`
 	// WrapUntrustedOutput fences tool output that carries external content
 	// (web pages, HTTP bodies, MCP results) so the model treats it as data and
 	// not as instructions — a defence against prompt injection. On by default.

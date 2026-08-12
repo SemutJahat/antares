@@ -69,7 +69,8 @@ func Default() *Config {
 			Personality: "default", Workspace: "~/antares-workspace",
 			Timezone: "Local", Language: "auto", IdleTimeoutSecs: 900,
 			RepeatLimit: 3, VerifyReplies: false, VerifyMax: 2, GoalMaxIterations: 10,
-			WrapUntrustedOutput: true, SmartTitles: true,
+			GoalAutonomousMaxIterations: 50,
+			WrapUntrustedOutput:         true, SmartTitles: true,
 		},
 		Tools: Tools{
 			Toolset: "default", ApprovalMode: "auto", MaxOutputChars: 60000,

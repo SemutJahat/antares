@@ -86,4 +86,4 @@ if ($userPath -notlike "*$BinDir*") {
 }
 
 Write-Host ""
-Info "next: run 'antares setup' to configure a provider, then 'antares' or 'antares serve'"
+Info "next: run 'antares setup' to configure a provider, then 'antares' to start it in the background (or 'antares tui' for the terminal UI)"

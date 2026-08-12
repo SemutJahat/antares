@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -46,7 +45,7 @@ func cmdServe(args []string) error {
 		case "--background", "-d", "--daemon":
 			// Background is the default; retain explicit aliases for scripts.
 		case "--help", "-h":
-			fmt.Println("usage: antares serve [--foreground]")
+			fmt.Println("usage: antares [--foreground]")
 			return nil
 		default:
 			return fmt.Errorf("unknown serve option %q", arg)
@@ -59,9 +58,6 @@ func cmdServe(args []string) error {
 }
 
 func startDaemon() error {
-	if runtime.GOOS != "linux" {
-		return errors.New("background serve is currently implemented on Linux; use antares serve --foreground")
-	}
 	if err := config.EnsureHome(); err != nil {
 		return err
 	}
@@ -233,9 +229,10 @@ func currentDaemon() (daemonState, bool, error) {
 }
 
 func discoverLegacyDaemon() (daemonState, bool, error) {
-	if runtime.GOOS != "linux" {
-		return daemonState{}, false, nil
-	}
+	// Recover a running server that has no state file — e.g. its antares.pid was
+	// removed, or it was started by an older binary. Works on every platform
+	// that implements the process/port helpers; where they return nothing (an
+	// unsupported OS) this simply finds no daemon.
 	cfg, err := config.Load()
 	if err != nil {
 		return daemonState{}, false, err

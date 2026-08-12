@@ -2,9 +2,12 @@ package agent
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	"github.com/enowdev/antares/internal/config"
 	"github.com/enowdev/antares/internal/llm"
+	"github.com/enowdev/antares/internal/store"
 )
 
 func TestRepeatTrackerTripsOnIdenticalCalls(t *testing.T) {
@@ -171,5 +174,81 @@ func TestRepeatKeyWriteFileDifferentPathDoesNotTrip(t *testing.T) {
 	got := r.record([]llm.ToolCall{{Name: "write_file", Arguments: `{"path":"b.txt","content":"x"}`}})
 	if len(got) != 0 {
 		t.Fatalf("different paths should not trip: %v", got)
+	}
+}
+
+func TestStuckEscalationTiers(t *testing.T) {
+	if stuckEscalation(0) != "" {
+		t.Error("no escalation expected when not stuck")
+	}
+	e1 := stuckEscalation(1)
+	if !strings.Contains(e1, "different approach") {
+		t.Errorf("tier 1 should push a different approach: %q", e1)
+	}
+	e2 := stuckEscalation(2)
+	if !strings.Contains(e2, "documentation") || !strings.Contains(e2, "web_search") {
+		t.Errorf("tier 2 should push docs + web search: %q", e2)
+	}
+	e3 := stuckEscalation(3)
+	if !strings.Contains(e3, "delegate") {
+		t.Errorf("tier 3 should push delegation: %q", e3)
+	}
+	// Beyond tier 3 stays at the strongest escalation, not empty.
+	if stuckEscalation(9) == "" {
+		t.Error("high stuck counts must still escalate")
+	}
+}
+
+func TestAutonomousMaxUsesGoalThenConfigDefault(t *testing.T) {
+	a := agentWithConfig(config.Default()) // GoalAutonomousMaxIterations default 50
+	if got := a.autonomousMax(&Goal{}); got != 50 {
+		t.Errorf("capless goal should use config default 50, got %d", got)
+	}
+	if got := a.autonomousMax(&Goal{Max: 12}); got != 12 {
+		t.Errorf("goal's own cap should win, got %d", got)
+	}
+	if got := a.autonomousMax(&Goal{Max: 0}); got != 50 {
+		t.Errorf("Max 0 falls back to config default (unlimited is decided by the caller), got %d", got)
+	}
+}
+
+func TestKickAutonomousGoalFiresDriver(t *testing.T) {
+	db, err := store.Open(context.Background(), "memory", "", 1, 5000, false)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	a := New(config.Default(), db, nil, nil, nil)
+
+	var fired []TurnEnded
+	a.OnTurnEnd(func(e TurnEnded) { fired = append(fired, e) })
+
+	ctx := context.Background()
+	// Autonomous goal -> kick fires with the session/platform/channel.
+	if err := a.SetGoal(ctx, "s1", &Goal{Text: "win", Autonomous: true}); err != nil {
+		t.Fatal(err)
+	}
+	a.KickAutonomousGoal(ctx, "s1", "discord", "c9")
+	if len(fired) != 1 || fired[0].SessionID != "s1" || fired[0].Platform != "discord" || fired[0].ChannelID != "c9" {
+		t.Fatalf("expected one kick for s1/discord/c9, got %+v", fired)
+	}
+
+	// A paused goal must not kick.
+	fired = nil
+	if err := a.SetGoal(ctx, "s2", &Goal{Text: "x", Autonomous: true, Paused: true}); err != nil {
+		t.Fatal(err)
+	}
+	a.KickAutonomousGoal(ctx, "s2", "web", "")
+	if len(fired) != 0 {
+		t.Fatalf("paused goal should not kick, got %+v", fired)
+	}
+
+	// A normal (non-autonomous) goal must not kick.
+	if err := a.SetGoal(ctx, "s3", &Goal{Text: "y"}); err != nil {
+		t.Fatal(err)
+	}
+	a.KickAutonomousGoal(ctx, "s3", "web", "")
+	if len(fired) != 0 {
+		t.Fatalf("non-autonomous goal should not kick, got %+v", fired)
 	}
 }

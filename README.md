@@ -13,11 +13,12 @@ turns, and answers from Telegram and Discord — all from a single process you r
 on your own machine.
 
 ```
-antares            # terminal UI
-antares serve      # start API + dashboard in the background on :8787
-antares status     # show the background server status
-antares stop       # stop the background server
-antares setup      # configure it, in the browser or the terminal
+antares              # start API + dashboard in the background on :8787
+antares --foreground # run attached to this terminal (systemd, Docker, debug)
+antares tui          # open the terminal UI
+antares status       # show the background server status
+antares stop         # stop the background server
+antares setup        # configure it, in the browser or the terminal
 ```
 
 > [!NOTE]
