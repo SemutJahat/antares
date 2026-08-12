@@ -270,20 +270,25 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 		id, label string
 	}
 	var targets []target
+	var agentTargets []target
 	seen := map[string]bool{}
 	add := func(id, label, kind string) {
 		if seen[id] {
 			return
 		}
-		// Agent integrations (Cursor) are never aggregated here, even when
-		// keyed via the environment: this endpoint feeds the active-model
-		// picker, and an agent capability cannot be the active chat model.
-		if providers.CapabilityForKind(kind) == providers.CapabilityAgent {
-			seen[id] = true
-			return
-		}
 		p := cfg.Providers[id]
 		keyed := p.APIKey != "" || (p.APIKeyEnv != "" && os.Getenv(p.APIKeyEnv) != "")
+		// Agent integrations (Cursor) are listed so their catalogue is
+		// visible — you pick one of these ids for the cursor_agent tool — but
+		// they are fetched separately and tagged, because an agent capability
+		// can never become the active chat model. /model/set refuses them.
+		if providers.CapabilityForKind(kind) == providers.CapabilityAgent {
+			seen[id] = true
+			if keyed && p.Enabled {
+				agentTargets = append(agentTargets, target{id: id, label: firstNonEmpty(p.Label, label, id)})
+			}
+			return
+		}
 		if keyed || isLocalEndpoint(p.BaseURL) {
 			targets = append(targets, target{id: id, label: firstNonEmpty(p.Label, label, id)})
 			seen[id] = true
@@ -300,6 +305,9 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 		llm.ModelInfo
 		Provider      string `json:"provider"`
 		ProviderLabel string `json:"provider_label"`
+		// "llm" (selectable as the chat model) or "agent" (shown for reference
+		// and for naming in a tool call; never selectable).
+		Capability string `json:"capability"`
 	}
 	type provErr struct {
 		Provider string `json:"provider"`
@@ -325,7 +333,32 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			for _, m := range list {
-				models = append(models, row{ModelInfo: m, Provider: t.id, ProviderLabel: t.label})
+				models = append(models, row{
+					ModelInfo: m, Provider: t.id, ProviderLabel: t.label,
+					Capability: string(providers.CapabilityLLM),
+				})
+			}
+		}(t)
+	}
+
+	// Agent catalogues come from the provider's own endpoint, not agent.Models
+	// (which builds an LLM client and would be refused for this kind).
+	for _, t := range agentTargets {
+		wg.Add(1)
+		go func(t target) {
+			defer wg.Done()
+			list, err := s.agentProviderModels(r.Context(), t.id)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, provErr{Provider: t.id, Label: t.label, Error: err.Error()})
+				return
+			}
+			for _, m := range list {
+				models = append(models, row{
+					ModelInfo: m, Provider: t.id, ProviderLabel: t.label,
+					Capability: string(providers.CapabilityAgent),
+				})
 			}
 		}(t)
 	}

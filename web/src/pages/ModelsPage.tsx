@@ -50,6 +50,12 @@ interface ModelsResponse {
 interface AllModel extends ModelInfo {
   provider: string
   provider_label: string
+  /**
+   * "llm" models can become the active chat model; "agent" models belong to a
+   * cloud-agent integration (Cursor) and are listed for reference only — you
+   * name one in a cursor_agent call, you never chat with it.
+   */
+  capability?: 'llm' | 'agent'
 }
 
 interface AllModelsResponse {
@@ -195,7 +201,8 @@ function AllModelsView({
             </p>
           ) : null}
           {models.map((m) => {
-            const isActive = m.id === active.model && m.provider === active.provider
+            const isAgent = m.capability === 'agent'
+            const isActive = !isAgent && m.id === active.model && m.provider === active.provider
             return (
               <Card
                 key={`${m.provider}/${m.id}`}
@@ -210,6 +217,11 @@ function AllModelsView({
                     <Badge variant="secondary" className="shrink-0">
                       {providerName(m.provider_label)}
                     </Badge>
+                    {isAgent ? (
+                      <Badge variant="outline" className="shrink-0">
+                        {t('models.agentOnly')}
+                      </Badge>
+                    ) : null}
                   </div>
                   <p className="truncate font-mono text-[11px] text-muted-foreground">{m.id}</p>
                   <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
@@ -235,16 +247,25 @@ function AllModelsView({
                     ) : null}
                   </div>
                 </div>
-                <Button
-                  size="sm"
-                  variant={isActive ? 'secondary' : 'outline'}
-                  disabled={isActive}
-                  loading={saving === `${m.provider}/${m.id}`}
-                  onClick={() => onUse(m.id, m.provider)}
-                  className="shrink-0"
-                >
-                  {isActive ? t('common.active') : t('common.use')}
-                </Button>
+                {isAgent ? (
+                  // No "Use": a cloud agent has no chat endpoint, so making it
+                  // the active model would fail on every message. Name it in a
+                  // cursor_agent call instead.
+                  <span className="shrink-0 text-xs text-muted-foreground" title={t('models.agentOnlyHint')}>
+                    {t('models.viaTool')}
+                  </span>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant={isActive ? 'secondary' : 'outline'}
+                    disabled={isActive}
+                    loading={saving === `${m.provider}/${m.id}`}
+                    onClick={() => onUse(m.id, m.provider)}
+                    className="shrink-0"
+                  >
+                    {isActive ? t('common.active') : t('common.use')}
+                  </Button>
+                )}
               </Card>
             )
           })}

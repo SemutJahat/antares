@@ -10,6 +10,7 @@ import (
 
 	"github.com/enowdev/antares/internal/config"
 	"github.com/enowdev/antares/internal/cursor"
+	"github.com/enowdev/antares/internal/llm"
 	"github.com/enowdev/antares/internal/providers"
 )
 
@@ -54,6 +55,45 @@ func (s *Server) handleProviderModelInfo(w http.ResponseWriter, r *http.Request)
 // agent-capability provider (Cursor). It never touches cfg.Model and never
 // aggregates into /api/model/list-all — that isolation is what lets Cursor
 // carry its own model picker without disturbing the active chat model.
+// agentProviderModels fetches an agent integration's model catalogue as
+// llm.ModelInfo, so /model/list-all can show it alongside chat models. It does
+// not go through agent.Models: that builds an LLM client, which llm.New
+// deliberately refuses for an agent kind.
+func (s *Server) agentProviderModels(ctx context.Context, id string) ([]llm.ModelInfo, error) {
+	cfg := s.config()
+	if providers.CapabilityOf(cfg, id) != providers.CapabilityAgent {
+		return nil, fmt.Errorf("%s is not an agent integration", id)
+	}
+	_, p := cfg.ResolveProvider(id)
+	key := strings.TrimSpace(p.APIKey)
+	if key == "" {
+		return nil, nil
+	}
+	client, err := s.newCursorMetadataClient(cursor.Options{BaseURL: p.BaseURL, APIKey: key})
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	catalog, err := client.Models(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]llm.ModelInfo, 0, len(catalog.Items))
+	for _, m := range catalog.Items {
+		out = append(out, llm.ModelInfo{
+			ID:       m.ID,
+			Name:     firstNonEmpty(m.DisplayName, m.ID),
+			Provider: id,
+			// A cloud agent runs its own loop; it always uses tools, and the
+			// pricing/context fields Cursor reports are per-run, not per-token,
+			// so they are left zero rather than filled with a misleading value.
+			Tools: true,
+		})
+	}
+	return out, nil
+}
+
 func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
 	if s.requireDashboardPassword(w, r) {
 		return

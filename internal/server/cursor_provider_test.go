@@ -388,11 +388,16 @@ func TestCursorProviderModelsNeedsKeyWithoutNetworkCall(t *testing.T) {
 	}
 }
 
-// TestModelListAllExcludesCursor guards model isolation: list-all must never
-// call or include Cursor, even when it has a usable (env) credential.
-func TestModelListAllExcludesCursor(t *testing.T) {
+// TestModelListAllSkipsDisabledCursor: a keyed but disabled agent integration
+// contributes nothing. Enabling is the user's explicit act, and until then
+// list-all must not make a network call for it.
+func TestModelListAllSkipsDisabledCursor(t *testing.T) {
 	t.Setenv("CURSOR_API_KEY", "env-cursor-key")
-	s := newCursorTestServer(t, nil)
+	s := newCursorTestServer(t, nil) // cursor ships disabled
+	s.cursorFactory = func(cursor.Options) (cursorMetadataClient, error) {
+		t.Fatal("list-all called a disabled agent provider")
+		return nil, nil
+	}
 
 	r := httptest.NewRequest(http.MethodGet, "/api/model/list-all", nil)
 	r.Header.Set("Authorization", "Bearer test-token")
@@ -402,7 +407,79 @@ func TestModelListAllExcludesCursor(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if strings.Contains(rec.Body.String(), `"provider":"cursor"`) {
-		t.Fatalf("list-all touched the cursor provider: %s", rec.Body.String())
+		t.Fatalf("a disabled cursor still appeared: %s", rec.Body.String())
+	}
+}
+
+// TestModelListAllTagsEnabledCursorAsAgent: once enabled, Cursor's catalogue
+// IS listed — you need to see the ids to name one in a cursor_agent call — but
+// every row carries capability "agent" so the UI never offers it as the chat
+// model, and the chat models stay tagged "llm".
+func TestModelListAllTagsEnabledCursorAsAgent(t *testing.T) {
+	s := newCursorTestServer(t, func(c *config.Config) {
+		p := c.Providers["cursor"]
+		p.Enabled = true
+		p.APIKey = "cursor-key"
+		c.Providers["cursor"] = p
+	})
+	s.cursorFactory = func(cursor.Options) (cursorMetadataClient, error) {
+		return &fakeCursorMetadata{models: cursor.ModelCatalog{Items: []cursor.Model{
+			{ID: "composer-1", DisplayName: "Composer 1"},
+		}}}, nil
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/api/model/list-all", nil)
+	r.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.handleModelListAll(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Models []struct {
+			ID         string `json:"id"`
+			Provider   string `json:"provider"`
+			Capability string `json:"capability"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var found bool
+	for _, m := range body.Models {
+		if m.Provider != "cursor" {
+			if m.Capability != "llm" {
+				t.Errorf("chat model %s/%s tagged %q, want llm", m.Provider, m.ID, m.Capability)
+			}
+			continue
+		}
+		found = true
+		if m.Capability != "agent" {
+			t.Errorf("cursor model %s tagged %q, want agent", m.ID, m.Capability)
+		}
+	}
+	if !found {
+		t.Fatalf("enabled cursor contributed no models: %s", rec.Body.String())
+	}
+}
+
+// An agent model must still be refused as the active chat model, whatever the
+// list shows. This is the boundary the listing change must not weaken.
+func TestModelSetStillRefusesCursor(t *testing.T) {
+	s := newCursorTestServer(t, func(c *config.Config) {
+		p := c.Providers["cursor"]
+		p.Enabled = true
+		p.APIKey = "cursor-key"
+		c.Providers["cursor"] = p
+	})
+	r := httptest.NewRequest(http.MethodPost, "/api/model/set",
+		strings.NewReader(`{"model":"composer-1","provider":"cursor"}`))
+	r.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.handleModelSet(rec, r)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("cursor was accepted as the active model: %s", rec.Body.String())
 	}
 }
 
