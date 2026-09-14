@@ -14,7 +14,7 @@ func (s *Server) commandDeps() commands.Deps {
 		Config:  s.config,
 		Agent:   s.agent,
 		Store:   s.db,
-		Skills:  s.currentSkills(),
+		Skills:  s.skills,
 		MCP:     s.mcp,
 		Reload:  s.applyReload,
 		Version: version.Version,
@@ -72,13 +72,6 @@ func (s *Server) handleCommandRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	// A confident goal (`/goal auto`) must begin working immediately, not wait
-	// for some later turn. Kick the first autonomous iteration through the same
-	// wake path the auto-continue loop uses.
-	if res.Action.Kind == "goal_autostart" && body.SessionID != "" && s.agent != nil {
-		s.agent.KickAutonomousGoal(r.Context(), body.SessionID, "web", "")
-	}
-
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
 		"output": res.Output,

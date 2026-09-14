@@ -2,7 +2,7 @@ package server
 
 import (
 	"errors"
-	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"sort"
@@ -11,21 +11,17 @@ import (
 
 	"github.com/enowdev/antares/internal/config"
 	"github.com/enowdev/antares/internal/llm"
-	"github.com/enowdev/antares/internal/providers"
 	"github.com/enowdev/antares/internal/tools"
-	"gopkg.in/yaml.v3"
 )
 
 func configPath() string { return config.ConfigFile() }
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"values":           config.Get().Redacted(),
-		"schema":           config.Schema(),
-		"profile":          config.ActiveProfile(),
-		"path":             configPath(),
-		"restart_fields":   s.restartFields(),
-		"restart_required": len(s.restartFields()) > 0,
+		"values":  s.config().Redacted(),
+		"schema":  config.Schema(),
+		"profile": config.ActiveProfile(),
+		"path":    configPath(),
 	})
 }
 
@@ -35,8 +31,6 @@ func (s *Server) handleConfigSchema(w http.ResponseWriter, r *http.Request) {
 
 // handleUpdateConfig applies dotted-path updates and reloads dependent services.
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -75,10 +69,11 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-	}
-	if err := s.validateConfigChange(cfg); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
+		// Changing (or clearing) the dashboard password must not leave old
+		// logins valid.
+		if path == "server.dashboard_password_hash" {
+			s.invalidateDashSessions()
+		}
 	}
 	if err := config.Save(cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -88,13 +83,10 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"saved": len(paths), "values": config.Get().Redacted(), "restart_fields": s.restartFields(), "restart_required": len(s.restartFields()) > 0})
+	writeJSON(w, http.StatusOK, map[string]any{"saved": len(paths), "values": s.config().Redacted()})
 }
 
 func (s *Server) handleGetRawConfig(w http.ResponseWriter, r *http.Request) {
-	if s.requireDashboardPassword(w, r) {
-		return
-	}
 	text, err := config.Raw()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -104,8 +96,6 @@ func (s *Server) handleGetRawConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSaveRawConfig(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -113,15 +103,6 @@ func (s *Server) handleSaveRawConfig(w http.ResponseWriter, r *http.Request) {
 		YAML string `json:"yaml"`
 	}
 	if err := decodeBody(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	desired := config.Default()
-	if err := yaml.Unmarshal([]byte(body.YAML), desired); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := s.validateConfigChange(desired); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -133,22 +114,13 @@ func (s *Server) handleSaveRawConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"saved": true, "restart_fields": s.restartFields(), "restart_required": len(s.restartFields()) > 0})
+	writeJSON(w, http.StatusOK, map[string]bool{"saved": true})
 }
 
 // applyReload rebuilds services that depend on configuration.
 func (s *Server) applyReload() error {
-	previousHash := s.config().Server.DashboardPasswordHash
-	defer func() {
-		if s.config().Server.DashboardPasswordHash != previousHash {
-			s.invalidateDashSessions()
-		}
-	}()
 	if s.reloadFn == nil {
-		cfg, _ := config.Effective(s.config(), config.Get())
-		if err := cfg.Validate(); err != nil {
-			return err
-		}
+		cfg := config.Get()
 		s.SetConfig(cfg)
 		s.agent.SetConfig(cfg)
 		if s.gateway != nil {
@@ -159,24 +131,12 @@ func (s *Server) applyReload() error {
 	if err := s.reloadFn(); err != nil {
 		return err
 	}
-	s.SetConfig(s.agent.Config())
+	s.SetConfig(config.Get())
+	// The agent owns the rebuilt skill library after a reload.
+	if m := s.agent.Skills(); m != nil {
+		s.skills = m
+	}
 	return nil
-}
-
-func (s *Server) restartFields() []string {
-	_, fields := config.Effective(s.config(), config.Get())
-	if fields == nil {
-		return []string{}
-	}
-	return fields
-}
-
-func (s *Server) validateConfigChange(desired *config.Config) error {
-	if err := desired.Validate(); err != nil {
-		return err
-	}
-	effective, _ := config.Effective(s.config(), desired)
-	return effective.Validate()
 }
 
 // ---- models -----------------------------------------------------------------
@@ -205,25 +165,36 @@ func (s *Server) handleModelOptions(w http.ResponseWriter, r *http.Request) {
 		NeedsAPIVersion bool   `json:"needs_api_version,omitempty"`
 		NeedsBaseURL    bool   `json:"needs_base_url,omitempty"`
 		TimeoutSecs     int    `json:"timeout_seconds,omitempty"`
-		// Capability distinguishes chat-model providers ("llm") from agent
-		// integrations ("agent", e.g. Cursor) so the dashboard can route them
-		// to their own connection flow instead of the active-model picker.
-		Capability string `json:"capability"`
+		// Custom marks a user-defined provider. Customs always group under
+		// "API key" — even a localhost endpoint is a configured service, not
+		// one of the built-in local runtimes.
+		Custom bool `json:"custom,omitempty"`
 	}
 
 	// Every provider from the catalogue (configured or not), so the new kinds
 	// can be set up from here — then any custom providers only in the config.
+	// The catalogue's "custom" entry belongs to the first-run wizard, but older
+	// installations may still use that id for their real custom provider.
 	seen := map[string]bool{}
 	providerList := make([]providerInfo, 0)
 	for _, sp := range setupProviderCatalogue(cfg) {
 		p := cfg.Providers[sp.ID]
+		if sp.Custom && !legacyCustomProviderInUse(cfg, p) {
+			seen[sp.ID] = true
+			continue
+		}
+		label, kind := sp.Label, sp.Kind
+		if sp.Custom {
+			label = firstNonEmpty(p.Label, sp.Label)
+			kind = firstNonEmpty(p.Kind, sp.Kind)
+		}
 		providerList = append(providerList, providerInfo{
-			ID: sp.ID, Label: sp.Label, Kind: sp.Kind,
+			ID: sp.ID, Label: label, Kind: kind,
 			Enabled: p.Enabled, HasKey: p.APIKey != "", Local: sp.Local,
 			BaseURL: firstNonEmpty(p.BaseURL, sp.BaseURL), Active: sp.ID == cfg.Model.Provider,
 			Hint: sp.Hint, KeyHint: sp.KeyHint, KeyURL: sp.KeyURL, KeyLabel: sp.KeyLabel,
 			Note: sp.Note, NeedsRegion: sp.NeedsRegion, NeedsAPIVersion: sp.NeedsAPIVersion,
-			NeedsBaseURL: sp.NeedsBaseURL, TimeoutSecs: p.TimeoutSecs, Capability: sp.Capability,
+			NeedsBaseURL: sp.NeedsBaseURL, TimeoutSecs: p.TimeoutSecs, Custom: sp.Custom,
 		})
 		seen[sp.ID] = true
 	}
@@ -238,9 +209,9 @@ func (s *Server) handleModelOptions(w http.ResponseWriter, r *http.Request) {
 		p := cfg.Providers[name]
 		providerList = append(providerList, providerInfo{
 			ID: name, Label: firstNonEmpty(p.Label, name), Kind: p.Kind, Enabled: p.Enabled,
-			HasKey: p.APIKey != "", Local: isLocalEndpoint(p.BaseURL), BaseURL: p.BaseURL,
+			HasKey: p.APIKey != "", BaseURL: p.BaseURL,
 			Active: name == cfg.Model.Provider, TimeoutSecs: p.TimeoutSecs,
-			Capability: string(providers.CapabilityForKind(p.Kind)),
+			Custom: true, NeedsBaseURL: true,
 		})
 	}
 
@@ -250,6 +221,19 @@ func (s *Server) handleModelOptions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func legacyCustomProviderInUse(cfg *config.Config, p config.Provider) bool {
+	return cfg.Model.Provider == "custom" ||
+		p.Enabled ||
+		strings.TrimSpace(p.BaseURL) != "" ||
+		strings.TrimSpace(p.APIKey) != "" ||
+		strings.TrimSpace(p.APIKeyEnv) != "" ||
+		strings.TrimSpace(p.APIVersion) != "" ||
+		strings.TrimSpace(p.Region) != "" ||
+		len(p.Headers) > 0 ||
+		len(p.Models) > 0 ||
+		len(p.ModelMeta) > 0
+}
+
 func (s *Server) handleModelList(w http.ResponseWriter, r *http.Request) {
 	provider := r.URL.Query().Get("provider")
 	cfg := s.config()
@@ -257,17 +241,6 @@ func (s *Server) handleModelList(w http.ResponseWriter, r *http.Request) {
 	// Calling a provider we know has no credential just turns a known state
 	// into an opaque 401. Report the missing key instead.
 	id, p := cfg.ResolveProvider(provider)
-	// Agent integrations (Cursor) are not chat-model providers: fail before
-	// the generic agent.Models -> llm.New path, and point the caller at the
-	// dedicated discovery endpoint instead of a 401/500 from the guard below.
-	if providers.CapabilityOf(cfg, id) == providers.CapabilityAgent {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"models": []any{}, "provider": id, "capability": "agent",
-			"error": fmt.Sprintf(
-				"%s is an agent integration; browse its models via GET /api/providers/%s/models.", id, id),
-		})
-		return
-	}
 	if p.APIKey == "" && !isLocalEndpoint(p.BaseURL) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"models": []any{}, "needs_key": true, "provider": id,
@@ -308,7 +281,6 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 		id, label string
 	}
 	var targets []target
-	var agentTargets []target
 	seen := map[string]bool{}
 	add := func(id, label, kind string) {
 		if seen[id] {
@@ -316,17 +288,6 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 		}
 		p := cfg.Providers[id]
 		keyed := p.APIKey != "" || (p.APIKeyEnv != "" && os.Getenv(p.APIKeyEnv) != "")
-		// Agent integrations (Cursor) are listed so their catalogue is
-		// visible — you pick one of these ids for the cursor_agent tool — but
-		// they are fetched separately and tagged, because an agent capability
-		// can never become the active chat model. /model/set refuses them.
-		if providers.CapabilityForKind(kind) == providers.CapabilityAgent {
-			seen[id] = true
-			if keyed && p.Enabled {
-				agentTargets = append(agentTargets, target{id: id, label: firstNonEmpty(p.Label, label, id)})
-			}
-			return
-		}
 		if keyed || isLocalEndpoint(p.BaseURL) {
 			targets = append(targets, target{id: id, label: firstNonEmpty(p.Label, label, id)})
 			seen[id] = true
@@ -343,9 +304,6 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 		llm.ModelInfo
 		Provider      string `json:"provider"`
 		ProviderLabel string `json:"provider_label"`
-		// "llm" (selectable as the chat model) or "agent" (shown for reference
-		// and for naming in a tool call; never selectable).
-		Capability string `json:"capability"`
 	}
 	type provErr struct {
 		Provider string `json:"provider"`
@@ -370,33 +328,10 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 				errs = append(errs, provErr{Provider: t.id, Label: t.label, Error: err.Error()})
 				return
 			}
+			p := cfg.Providers[t.id]
 			for _, m := range list {
-				models = append(models, row{
-					ModelInfo: m, Provider: t.id, ProviderLabel: t.label,
-					Capability: string(providers.CapabilityLLM),
-				})
-			}
-		}(t)
-	}
-
-	// Agent catalogues come from the provider's own endpoint, not agent.Models
-	// (which builds an LLM client and would be refused for this kind).
-	for _, t := range agentTargets {
-		wg.Add(1)
-		go func(t target) {
-			defer wg.Done()
-			list, err := s.agentProviderModels(r.Context(), t.id)
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				errs = append(errs, provErr{Provider: t.id, Label: t.label, Error: err.Error()})
-				return
-			}
-			for _, m := range list {
-				models = append(models, row{
-					ModelInfo: m, Provider: t.id, ProviderLabel: t.label,
-					Capability: string(providers.CapabilityAgent),
-				})
+				m = withOfficialReasoning(p.Kind, p.BaseURL, m)
+				models = append(models, row{ModelInfo: m, Provider: t.id, ProviderLabel: t.label})
 			}
 		}(t)
 	}
@@ -417,9 +352,44 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func withOfficialReasoning(kind, baseURL string, m llm.ModelInfo) llm.ModelInfo {
+	cap := llm.OfficialReasoning(kind, baseURL, m.ID)
+	if len(cap.Values) == 0 {
+		return m
+	}
+	m.Reasoning = true
+	m.ReasoningCap = &cap
+	return m
+}
+
+// handleOfficialReasoningCapability returns the native reasoning ladder for
+// one official provider+model. Custom endpoints return an empty values list.
+func (s *Server) handleOfficialReasoningCapability(w http.ResponseWriter, r *http.Request) {
+	if s.requireDashboardPassword(w, r) {
+		return
+	}
+	cfg := s.config()
+	provider := r.URL.Query().Get("provider")
+	model := r.URL.Query().Get("model")
+	if provider == "" && strings.Contains(model, "/") {
+		provider, model, _ = strings.Cut(model, "/")
+	}
+	if provider == "" {
+		provider = cfg.Model.Provider
+	}
+	if model == "" {
+		model = cfg.Model.Default
+	}
+	p := cfg.Providers[provider]
+	cap := llm.OfficialReasoning(p.Kind, p.BaseURL, model)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provider":             provider,
+		"model":                model,
+		"reasoning_capability": cap,
+	})
+}
+
 func (s *Server) handleModelSet(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -442,17 +412,6 @@ func (s *Server) handleModelSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prevProvider := cfg.Model.Provider
-	resultProvider := prevProvider
-	if body.Provider != "" {
-		resultProvider = body.Provider
-	}
-	// An agent integration (Cursor) can never become the active chat model —
-	// checked before any mutation, memory swap, or disk write below.
-	if providers.CapabilityOf(cfg, resultProvider) == providers.CapabilityAgent {
-		writeError(w, http.StatusBadRequest,
-			fmt.Errorf("%q is an agent integration and cannot be the active model", resultProvider))
-		return
-	}
 	cfg.Model.Default = body.Model
 	if body.Provider != "" {
 		cfg.Model.Provider = body.Provider
@@ -471,14 +430,18 @@ func (s *Server) handleModelSet(w http.ResponseWriter, r *http.Request) {
 			cfg.ClearInlineModelCredentials()
 		}
 	}
+	// Normalize synchronously BEFORE publishing the pointer to the agent, so the
+	// background save never mutates a struct the agent is concurrently reading
+	// during a live turn. The goroutine then only marshals and writes bytes.
 	config.Normalize(cfg)
-	if err := config.SaveNormalizedAt(config.ConfigFile(), cfg); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	effective, _ := config.Effective(s.config(), cfg)
-	s.agent.SetConfig(effective)
-	s.SetConfig(effective)
+	s.agent.SetConfig(cfg)
+	s.SetConfig(cfg)
+	savePath := config.ConfigFile()
+	go func(c *config.Config, path string) {
+		if err := config.SaveNormalizedAt(path, c); err != nil {
+			slog.Warn("async config save failed after model switch", "error", err)
+		}
+	}(cfg, savePath)
 	writeJSON(w, http.StatusOK, map[string]string{"model": body.Model, "provider": cfg.Model.Provider})
 }
 
@@ -516,8 +479,6 @@ func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleToggleTool(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -553,8 +514,6 @@ func (s *Server) handleToggleTool(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSetToolset(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}

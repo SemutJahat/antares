@@ -1,21 +1,14 @@
-# Antares — Handoff (historical)
+# Antares — Handoff
 
-Last updated: 2026-09-14. This document is a historical log kept for
-context; nothing below is an assertion about the current `main` branch.
-Where the working tree and this note disagree, the working tree wins.
+Last updated: 2026-08-08. Branch: `main`. Working tree: clean.
+**11 commits are committed locally but NOT pushed** (`dff21d7`..`0119b7a`).
 
-> The 2026-08-08 snapshot below (11 unpushed commits on `main`) was the
-> state at the time it was written. The counts, the "not pushed" claim,
-> and the "not yet done" items are preserved for archaeology, not as a
-> current status report — check `git log` for what is really on `main`.
+## Goal
 
-## Goal (as of 2026-08-08)
-
-Ongoing maintenance of Antares (Go backend + React/Vite dashboard in
-`web/`). This session cleared the open PR, added an LLM provider, and
-fixed a run of dashboard and Discord/Telegram gateway issues reported by
-the user. Everything below was done and green in that session unless
-called out under **Next Steps**.
+Ongoing maintenance of Antares (Go backend + React/Vite dashboard in `web/`).
+This session cleared the open PR, added an LLM provider, and fixed a run of
+dashboard and Discord/Telegram gateway issues reported by the user. Everything
+below is done and green unless called out under **Next Steps**.
 
 ## How to build / run (read this first)
 
@@ -115,16 +108,31 @@ called out under **Next Steps**.
 
 1. **Push the 11 local commits** once the user is ready (they have not asked yet —
    do NOT push without confirmation).
-2. **Agent loop guardrail — completed after this snapshot.** The proposal
-   was: detect repeated `write_file`/`edit_file` to the SAME path
-   (regardless of content) as a repeat. It is now live —
-   `internal/agent/harness.go:repeatKey` fingerprints those two tools by
-   the target path only, so a model retrying the same file with slightly
-   different content trips the guard on the third call and hits the
-   hard-stop as before; `TestRepeatKeyWriteFileSamePathDifferentContent`,
-   `TestRepeatKeyEditFileSamePathDifferentContent`, and
-   `TestRepeatKeyWriteFileDifferentPathDoesNotTrip` in `harness_test.go`
-   pin the behaviour. No follow-up on this item.
+2. **Agent loop guardrail (still open — the fix once proposed here was tried and
+   reverted).** The agent can loop writing the same file with slightly different
+   contents; the repeat tracker fingerprints name+args, so changing the content
+   never trips it. The fix this note used to recommend — treat repeated
+   `write_file`/`edit_file` to the SAME path as a repeat regardless of content —
+   was implemented and then removed again in "Tell a stuck loop apart from
+   ordinary progress". Keying on the path alone cannot tell three different edits
+   to one file from one edit made three times, so it fired on ordinary work, which
+   for a coding agent is most of the work. **Do not reintroduce it.** `repeatKey`
+   is now uniform over the full normalised arguments for every tool, and
+   `internal/agent/repeat_guard_test.go` fails if `write_file`, `edit_file` or
+   `vps_upload` is given a coarser key again. Those are the three names that ever
+   carried a special case, and the test names each of them; it asserts nothing
+   about any other tool, so a coarser key introduced for a different tool would
+   pass. The loop itself is therefore still unsolved: a model that varies the
+   content each time is bounded only by the ceilings below, and any replacement
+   needs a signal other than the call fingerprint. This is what produced the giant
+   turn that caused the OOM in item 4 — the frontend is now hardened, but the loop
+   remains.
+
+   The ceilings as they actually stand: the hard stop is 60 tool calls per segment
+   (`HardStopAfter`), `grContinue` may reset it up to 4× (`maxGuardrailContinues`,
+   `harness.go:477`) for five segments, and `AbsoluteMaxToolCalls: 200`
+   (`config/defaults.go:137`) caps the whole run regardless — so 200 calls, not the
+   ~600 this note previously claimed.
 3. **Rotate exposed credentials.** The Z.ai API key and Voyage embed key were
    visible in `~/.antares/config.yaml` read during earlier sessions. Still
    outstanding; user's call.

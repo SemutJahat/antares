@@ -41,21 +41,16 @@ func Default() *Config {
 				Kind: "openai-compatible", Label: "LM Studio", Enabled: false,
 				BaseURL: "http://127.0.0.1:1234/v1", TimeoutSecs: 600,
 			},
-			"custom": {
-				Kind: "custom", Label: "Custom endpoint", Enabled: false, TimeoutSecs: 300,
-			},
-			// Cloud agents are opt-in even when a key is present in the environment.
-			"cursor": {
-				Kind: "cursor-agent", Label: "Cursor Cloud Agents", Enabled: false,
-				BaseURL: "https://api.cursor.com", APIKeyEnv: "CURSOR_API_KEY", TimeoutSecs: 900,
-			},
+			// No default "custom" entry: user-defined providers are created on
+			// demand via POST /api/providers, named and deletable like any
+			// other. The legacy single "custom" slot is not seeded anymore.
 		},
 		Database: Database{
 			Driver: "sqlite", DSN: filepath.Join(Home(), "antares.db"),
 			MaxConns: 8, Busy: 5000, WAL: true,
 		},
 		Server: Server{
-			Host: "127.0.0.1", Port: 8787,
+			Host: "0.0.0.0", Port: 8787,
 			// Same-origin is the safe default. Cross-origin access must be
 			// explicitly configured by the operator.
 			CORSOrigins: []string{},
@@ -69,13 +64,11 @@ func Default() *Config {
 			WrapUntrustedOutput:         true, SmartTitles: true,
 		},
 		Tools: Tools{
-			Toolset: "coding", ApprovalMode: "prompt", MaxOutputChars: 60000,
+			Toolset: "default", ApprovalMode: "auto", MaxOutputChars: 60000,
 			Timeouts: map[string]int{
 				"terminal": 300, "web_fetch": 60, "web_search": 30,
 				// VPS tools allow up to 900s per call; keep the agent envelope above that.
 				"vps_run": 960, "vps_upload": 960, "vps_download": 960,
-				// Cursor's provider wait defaults to 900s; leave envelope/serialization margin.
-				"cursor_agent": 960, "cursor_agent_status": 960,
 			},
 			WebSearch: WebSearch{Provider: "browser", MaxResults: 8},
 			Browser: Browser{
@@ -86,13 +79,15 @@ func Default() *Config {
 				// on first browser use.
 				Stealth: true,
 			},
-			HTTP:     HTTP{Preset: "chrome-131", WrapTerminal: true},
-			Platform: map[string]string{},
+			HTTP: HTTP{Preset: "chrome-131", WrapTerminal: true},
+			Platform: map[string]string{
+				"cli": "default", "web": "default", "telegram": "default", "discord": "default",
+			},
 		},
 		Terminal: Terminal{
 			Backend: "local", CWD: "~/antares-workspace", Timeout: 300,
 			HomeMode: "workspace", LifetimeSeconds: 3600, Shell: "",
-			Sandbox:         "auto",
+			Sandbox:         "none",
 			BlockedCommands: []string{"rm -rf /", "mkfs", ":(){:|:&};:", "shutdown", "reboot"},
 			AllowNetwork:    true, DockerImage: "debian:bookworm-slim",
 		},
@@ -140,7 +135,7 @@ func Default() *Config {
 		Logging: Logging{Level: "info", File: filepath.Join(Home(), "logs", "antares.log")},
 		MCP:     MCP{Enabled: true, Servers: map[string]MCPServer{}},
 
-		MaxConcurrentSessions: 4,
+		MaxConcurrentSessions: 0,
 		GroupSessionsPerUser:  true,
 		Social: Social{
 			Enabled:  false,

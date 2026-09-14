@@ -40,8 +40,6 @@ func (s *Server) handleGoogleVerify(w http.ResponseWriter, r *http.Request) {
 // handleGoogleSelect persists which account (the /u/<N>/ index) the Google
 // lookups act as, chosen from the verified list.
 func (s *Server) handleGoogleSelect(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}

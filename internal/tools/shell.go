@@ -3,6 +3,7 @@ package tools
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/enowdev/antares/internal/config"
 	"github.com/enowdev/antares/internal/sandbox"
+	"github.com/enowdev/antares/internal/textutil"
 )
 
 // ShellManager owns one long-lived shell per session so `cd`, exported
@@ -647,6 +649,12 @@ func (terminalTool) Schema() map[string]any {
 	}, "command")
 }
 
+// ShellCommand lets callers read the command this call would run without
+// knowing which tool holds the shell.
+func (terminalTool) ShellCommand(args json.RawMessage) (string, bool) {
+	return commandArgument(args)
+}
+
 func (terminalTool) Execute(ctx context.Context, in Input) Result {
 	var args struct {
 		Command    string `json:"command"`
@@ -720,12 +728,11 @@ func trimOutput(s string, limit int) string {
 	if limit <= 0 {
 		limit = 60000
 	}
-	if len(s) <= limit {
+	head, tail, removed := textutil.TruncateMiddleParts(s, limit)
+	if removed == 0 {
 		return s
 	}
-	head := limit * 2 / 3
-	tail := limit - head
-	return s[:head] + fmt.Sprintf("\n\n… %d characters omitted …\n\n", len(s)-limit) + s[len(s)-tail:]
+	return head + fmt.Sprintf("\n\n… %d characters omitted …\n\n", removed) + tail
 }
 
 func max(a, b int) int {

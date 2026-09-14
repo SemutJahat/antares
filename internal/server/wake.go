@@ -117,14 +117,6 @@ func (s *Server) startWakeTurn(session, note string) {
 			// Drain: fold every queued result into one more turn.
 			if len(queued) > 0 {
 				s.startWakeTurn(session, strings.Join(queued, "\n\n---\n\n"))
-				return
-			}
-			// Autonomous goal: agent.OnTurnEnd fires while this turn is still
-			// marked running (so it no-ops there); re-check now that the slot is
-			// free, and drive the next iteration. The goal's own cap / pause /
-			// done state is what ends the loop.
-			if s.agent != nil && s.agent.ShouldAutoContinueGoal(context.Background(), session) {
-				s.startWakeTurn(session, goalContinueNote)
 			}
 		}()
 		req := agent.Request{
@@ -132,81 +124,13 @@ func (s *Server) startWakeTurn(session, note string) {
 			ContextInject: note,
 			Platform:      "web",
 		}
-		res, err := s.agent.RunQueued(context.Background(), req, func(e agent.Event) error {
+		if _, err := s.agent.Run(context.Background(), req, func(e agent.Event) error {
 			lr.publish(e)
 			return nil
-		})
-		if err != nil {
+		}); err != nil {
 			slog.Debug("wake turn failed", "error", err, "session", session)
-			return
-		}
-		// If this is an autonomous goal started from a messaging gateway, deliver
-		// the continued turn's reply back to that chat, not only the dashboard.
-		if res != nil && strings.TrimSpace(res.Reply) != "" && s.gateway != nil {
-			if g, ok := s.agent.GetGoal(context.Background(), session); ok &&
-				g.Autonomous && g.Platform != "" && g.ChannelID != "" {
-				target := g.Platform + ":" + g.ChannelID
-				if derr := s.gateway.Deliver(context.Background(), target, res.Reply); derr != nil {
-					slog.Debug("gateway deliver of autonomous goal turn failed", "error", derr, "target", target)
-				}
-			}
 		}
 	}()
-}
-
-// goalContinueNote is injected (as hidden context, like a wake) to start the
-// next iteration of a confident autonomous goal. The standing goal itself is
-// already in the system prompt; this only tells the agent to carry on with it
-// rather than waiting for the user.
-const goalContinueNote = "[Autonomous goal] Continue working towards the standing goal now. " +
-	"Do not wait for the user and do not ask whether to proceed — take the next concrete step yourself. " +
-	"If you are stuck, change approach: read the documentation, search the web for how to do it, or delegate a research sub-agent."
-
-// onTurnEnd is registered on the agent. When a turn ends with a confident
-// autonomous goal still running, it starts the next turn on its own — through
-// the same per-session wake queue, so it can never overlap a live turn or a
-// sub-agent wake.
-func (s *Server) onTurnEnd(e agent.TurnEnded) {
-	if e.SessionID == "" {
-		return
-	}
-	// If a turn is already running/queued for this session, do nothing: whatever
-	// is driving will end and this same check runs again. Only an idle session
-	// needs a fresh turn started here.
-	s.wake.mu.Lock()
-	running := s.wake.running[e.SessionID]
-	s.wake.mu.Unlock()
-	if running || s.hub.get(e.SessionID) != nil {
-		return
-	}
-	s.startWakeTurn(e.SessionID, goalContinueNote)
-}
-
-// resumeAutonomousGoals restarts confident autonomous goals that were still
-// running when the server last stopped, so an unattended goal survives a
-// restart. Best-effort: a failure here must never block startup.
-func (s *Server) resumeAutonomousGoals() {
-	if s.agent == nil || s.db == nil {
-		return
-	}
-	ctx := context.Background()
-	goals, err := s.db.ListKV(ctx, "goal:")
-	if err != nil {
-		slog.Debug("resume autonomous goals: list failed", "error", err)
-		return
-	}
-	for key := range goals {
-		sessionID := strings.TrimPrefix(key, "goal:")
-		if sessionID == "" {
-			continue
-		}
-		g, ok := s.agent.GetGoal(ctx, sessionID)
-		if !ok || g == nil || !g.Autonomous || g.Done || g.Paused {
-			continue
-		}
-		slog.Info("resuming autonomous goal after restart", "session", sessionID)
-		s.startWakeTurn(sessionID, goalContinueNote)
-	}
 }
 
 // drainAfterTurn is called when a user-driven turn ends. If sub-agent results
@@ -226,3 +150,5 @@ func (s *Server) drainAfterTurn(session string) {
 	}
 	s.startWakeTurn(session, strings.Join(queued, "\n\n---\n\n"))
 }
+
+

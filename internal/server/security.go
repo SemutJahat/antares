@@ -80,23 +80,6 @@ func requestIsLoopback(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// requestIsSameOriginBrowser reports whether a browser-issued request is
-// safe to treat as originating from the dashboard itself. It closes the CSRF
-// hole that requestIsLoopback alone would leave open: a page on any origin
-// running inside the operator's browser is loopback, but its cross-origin
-// simple requests carry `Sec-Fetch-Site: cross-site`. Non-browser callers
-// (curl, the CLI, scripts) simply do not set the header, and their loopback
-// or bearer credential is already enough — they must not be blocked here.
-func requestIsSameOriginBrowser(r *http.Request) bool {
-	site := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
-	if site == "" {
-		// Not a Fetch-Metadata-capable browser: fall back to the caller's
-		// existing check (loopback / bearer). This preserves scripted access.
-		return true
-	}
-	return site == "same-origin" || site == "none"
-}
-
 // requireSetupAccess keeps the first-run mutating endpoints local unless the
 // operator has already configured a bearer token. Setup status remains a
 // read-only endpoint so the UI can explain how to bootstrap an instance.
@@ -106,18 +89,10 @@ func (s *Server) requireSetupAccess(w http.ResponseWriter, r *http.Request) bool
 		writeError(w, http.StatusConflict, errors.New("initial setup has already been completed"))
 		return true
 	}
-	// Bearer credential is a scripted/CLI caller — trust it as-is.
-	if s.bearerAuthorized(r) {
+	if requestIsLoopback(r) || s.bearerAuthorized(r) {
 		return false
 	}
-	// Loopback alone is not enough: a page on any origin running in the
-	// operator's browser is loopback, so the caller must additionally look
-	// like a same-origin fetch (or a non-browser client that does not send
-	// Fetch-Metadata at all).
-	if requestIsLoopback(r) && requestIsSameOriginBrowser(r) {
-		return false
-	}
-	writeError(w, http.StatusForbidden, errors.New("initial setup is available only from a same-origin loopback client or with a configured bearer token"))
+	writeError(w, http.StatusForbidden, errors.New("initial setup is available only from loopback or with a configured bearer token"))
 	return true
 }
 
@@ -178,6 +153,47 @@ func dns64AddressMatches(ip net.IP, prefixes []nat64Prefix, publicV4 map[string]
 func validateProviderBaseURLWithResolver(
 	ctx context.Context, raw string, allowLocal bool, resolver providerIPResolver,
 ) error {
+	return validateProviderBaseURLWithOptions(ctx, raw, allowLocal, false, resolver)
+}
+
+// providerIPPermitted reports whether an otherwise-blocked address may be used.
+// allowLocal (built-in local catalogue entries) admits loopback only. A custom
+// user-defined endpoint (allowPrivate) is the user pointing Antares at their
+// own service, so private/LAN ranges are accepted there as well. Link-local
+// stays blocked for both — it carries the cloud metadata endpoints.
+func providerIPPermitted(ip net.IP, allowLocal, allowPrivate bool) bool {
+	if allowLocal && ip.IsLoopback() {
+		return true
+	}
+	if allowPrivate && (ip.IsLoopback() || ip.IsPrivate()) {
+		return true
+	}
+	return false
+}
+
+// validateCustomProviderBaseURL validates a user-defined provider endpoint:
+// the user names the service, so loopback and LAN addresses are allowed.
+func (s *Server) validateCustomProviderBaseURL(ctx context.Context, raw string) error {
+	resolver := s.providerResolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	return validateProviderBaseURLWithOptions(ctx, raw, true, true, resolver)
+}
+
+// validateChosenBaseURL picks the URL rule for a provider being connected:
+// user-defined endpoints may live on loopback/LAN, built-ins use their
+// catalogue's local flag. Callers pass local=false alongside custom=true.
+func (s *Server) validateChosenBaseURL(ctx context.Context, raw string, custom, local bool) error {
+	if custom {
+		return s.validateCustomProviderBaseURL(ctx, raw)
+	}
+	return s.validateProviderBaseURL(ctx, raw, local)
+}
+
+func validateProviderBaseURLWithOptions(
+	ctx context.Context, raw string, allowLocal, allowPrivate bool, resolver providerIPResolver,
+) error {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return errors.New("provider base_url is required")
@@ -195,7 +211,7 @@ func validateProviderBaseURLWithResolver(
 
 	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 	if ip := net.ParseIP(host); ip != nil {
-		if providerIPBlocked(ip) && !(allowLocal && ip.IsLoopback()) {
+		if providerIPBlocked(ip) && !providerIPPermitted(ip, allowLocal, allowPrivate) {
 			return providerIPError(ip)
 		}
 		return nil
@@ -214,7 +230,7 @@ func validateProviderBaseURLWithResolver(
 	publicV4 := map[string]struct{}{}
 	var blockedV6 []net.IP
 	for _, ip := range ips {
-		blocked := providerIPBlocked(ip) && !(allowLocal && ip.IsLoopback())
+		blocked := providerIPBlocked(ip) && !providerIPPermitted(ip, allowLocal, allowPrivate)
 		if !blocked {
 			if v4 := ip.To4(); v4 != nil && !providerIPBlocked(v4) {
 				publicV4[v4.String()] = struct{}{}

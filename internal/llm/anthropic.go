@@ -194,14 +194,7 @@ func (c *anthropicClient) buildBody(req Request, stream bool) map[string]any {
 			}
 		}
 	}
-	switch strings.ToLower(req.ReasoningEffort) {
-	case "low":
-		body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": 2048}
-	case "medium":
-		body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": 8192}
-	case "high":
-		body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": 16384}
-	}
+	mergeEncoded(body, OfficialReasoning(c.opts.Kind, c.opts.BaseURL, req.Model).Encode(req.ReasoningEffort))
 	if _, ok := body["thinking"]; ok {
 		// Thinking requires headroom beyond the budget.
 		if maxTokens < 16384 {
@@ -289,6 +282,9 @@ func (c *anthropicClient) Stream(ctx context.Context, req Request, emit func(Eve
 		finish    string
 		model     = req.Model
 		blockKind = map[int]string{}
+		// A stop_reason in message_delta is not the end of the stream: Anthropic
+		// still owes a message_stop, and a gateway can drop the body in between.
+		sawTerminal bool
 	)
 
 	err = sseLines(httpResp.Body, func(evName, data string) error {
@@ -356,6 +352,10 @@ func (c *anthropicClient) Stream(ctx context.Context, req Request, emit func(Eve
 				call.Name = ev.ContentBlock.Name
 				return emit(Event{Type: EventToolCallStart, Index: ev.Index, ToolCallID: call.ID, ToolName: call.Name})
 			}
+		case "content_block_stop":
+			if blockKind[ev.Index] == "tool_use" {
+				acc.markComplete(ev.Index)
+			}
 		case "content_block_delta":
 			switch ev.Delta.Type {
 			case "text_delta":
@@ -388,14 +388,22 @@ func (c *anthropicClient) Stream(ctx context.Context, req Request, emit func(Eve
 				u := usage
 				return emit(Event{Type: EventUsage, Usage: &u})
 			}
+		case "message_stop":
+			sawTerminal = true
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	if !sawTerminal {
+		return nil, fmt.Errorf("%w: the stream ended without message_stop", ErrStreamTruncated)
+	}
 
-	calls := acc.result()
+	calls, err := acc.result()
+	if err != nil {
+		return nil, err
+	}
 	for i, call := range calls {
 		if err := emit(Event{Type: EventToolCallEnd, Index: i, ToolCallID: call.ID, ToolName: call.Name, Delta: call.Arguments}); err != nil {
 			return nil, err

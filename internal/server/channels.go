@@ -270,8 +270,6 @@ func channelSpecByID(id string) (channelSpec, bool) {
 
 // handleSetChannelConfig writes a channel's credential fields, then reconnects.
 func (s *Server) handleSetChannelConfig(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	var body struct {
 		Fields  map[string]string `json:"fields"`
 		Enabled *bool             `json:"enabled"`

@@ -22,7 +22,6 @@ type Field struct {
 	Secret  bool     `json:"secret"`
 	Enum    []string `json:"enum,omitempty"`
 	Help    string   `json:"help,omitempty"`
-	Reload  string   `json:"reload"`
 }
 
 // Tiers a field can belong to.
@@ -116,38 +115,35 @@ var enums = map[string][]string{
 	"session_reset.mode":        {"never", "idle", "daily"},
 	"display.theme":             {"system", "light", "dark"},
 	"logging.level":             {"debug", "info", "warn", "error"},
-	"agent.reasoning_effort":    {"none", "low", "medium", "high"},
-	"model.reasoning_effort":    {"none", "low", "medium", "high"},
 	"tools.web_search.provider": {"browser", "brave", "tavily", "searxng", "none"},
 }
 
 var help = map[string]string{
-	"model.default":                        "Model id as your provider spells it, e.g. anthropic/claude-sonnet-4.5.",
-	"model.provider":                       "Which entry under providers to call.",
-	"model.auxiliary":                      "Cheaper model used for summarising and other background work.",
-	"model.context_window":                 "Used to decide when to compact; set it to match your model.",
-	"database.driver":                      "sqlite for a single node, postgres when you share state.",
-	"database.dsn":                         "sqlite: a file path. postgres: postgres://user:pass@host:5432/db?sslmode=disable",
-	"server.auth_token":                    "Bearer API credential. A non-loopback listener requires this or a dashboard password unless auth_disabled is explicitly enabled.",
-	"server.host":                          "0.0.0.0 exposes it on every interface; 127.0.0.1 keeps it local.",
-	"agent.workspace":                      "The only directory file tools may read or write.",
-	"agent.system_prompt_extra":            "Appended to the system prompt on every turn.",
-	"tools.toolset":                        "Preset deciding which tools reach the model.",
-	"tools.approval_mode":                  "prompt asks before mutations; auto runs them directly; deny refuses them.",
-	"rag.rerank_mode":                      "How to reorder results: llm (an auxiliary model scores them), api (an external reranker), or off.",
-	"rag.embed_model":                      "The embedding model for indexing and search, e.g. text-embedding-3-small.",
-	"rag.per_user":                         "Keep a separate memory per chat user (Discord/Telegram), so the agent can recall topics and facts about each specific person. Stores cross-conversation data about individuals; off by default.",
-	"max_concurrent_sessions":              "Maximum simultaneous top-level turns across all entrypoints. Zero is unlimited; nested delegation uses its own limits.",
-	"compression.threshold":                "Fraction of the context window that triggers automatic compaction.",
-	"terminal.backend":                     "local runs on this machine; docker and ssh sandbox it elsewhere.",
-	"memory.memory_enabled":                "Lets the agent store durable facts between sessions.",
-	"skills.auto_create":                   "Allows the agent to write new skills on its own.",
-	"osint.google_cookie":                  "Optional. A logged-in Google Cookie header enables osint_google to resolve an email to its public profile. ToS-sensitive; uses your own session. Leave empty to disable.",
-	"display.show_reasoning":               "Stream and show model reasoning/thinking in the dashboard (and TUI). Off skips emitting reasoning events so long thinking traces never hit the UI.",
-	"display.tool_progress":                "Show live tool progress lines while a tool runs.",
-	"display.max_live_reasoning_chars":     "Max characters of reasoning kept in the browser while a turn streams (trailing window). Prevents tab freezes on long thinking. Default 48000. 0 = unlimited. Full text is still saved server-side and restored after the turn.",
-	"agent.goal_max_iterations":            "How many judge cycles a normal standing goal runs before it pauses (resumable). Default 10.",
-	"agent.goal_autonomous_max_iterations": "Default iteration cap for a confident autonomous goal (`/goal auto`), which keeps working across turns unattended. Separate from — and usually higher than — goal_max_iterations. A per-goal cap of 0 means unlimited. At the cap the goal pauses, it does not stop. Default 50.",
+	"model.default":                    "Model id as your provider spells it, e.g. anthropic/claude-sonnet-4.5.",
+	"model.provider":                   "Which entry under providers to call.",
+	"model.auxiliary":                  "Cheaper model used for summarising and other background work.",
+	"model.context_window":             "Used to decide when to compact; set it to match your model.",
+	"model.reasoning_effort":           "Official provider-native reasoning value for this model. Leave empty for the provider default. Custom endpoints send the selected value as reasoning_effort.",
+	"agent.reasoning_effort":           "Fallback reasoning value when a turn does not set one. Official adapters only send values the active model accepts.",
+	"database.driver":                  "sqlite for a single node, postgres when you share state.",
+	"database.dsn":                     "sqlite: a file path. postgres: postgres://user:pass@host:5432/db?sslmode=disable",
+	"server.auth_token":                "Leave empty to keep the dashboard open — sensible behind a private network.",
+	"server.host":                      "0.0.0.0 exposes it on every interface; 127.0.0.1 keeps it local.",
+	"agent.workspace":                  "The only directory file tools may read or write.",
+	"agent.system_prompt_extra":        "Appended to the system prompt on every turn.",
+	"tools.toolset":                    "Preset deciding which tools reach the model.",
+	"tools.approval_mode":              "auto runs mutating tools directly; deny blocks them.",
+	"rag.rerank_mode":                  "How to reorder results: llm (an auxiliary model scores them), api (an external reranker), or off.",
+	"rag.embed_model":                  "The embedding model for indexing and search, e.g. text-embedding-3-small.",
+	"rag.per_user":                     "Keep a separate memory per chat user (Discord/Telegram), so the agent can recall topics and facts about each specific person. Stores cross-conversation data about individuals; off by default.",
+	"compression.threshold":            "Fraction of the context window that triggers automatic compaction.",
+	"terminal.backend":                 "local runs on this machine; docker and ssh sandbox it elsewhere.",
+	"memory.memory_enabled":            "Lets the agent store durable facts between sessions.",
+	"skills.auto_create":               "Allows the agent to write new skills on its own.",
+	"osint.google_cookie":              "Optional. A logged-in Google Cookie header enables osint_google to resolve an email to its public profile. ToS-sensitive; uses your own session. Leave empty to disable.",
+	"display.show_reasoning":           "Stream and show model reasoning/thinking in the dashboard (and TUI). Off skips emitting reasoning events so long thinking traces never hit the UI.",
+	"display.tool_progress":            "Show live tool progress lines while a tool runs.",
+	"display.max_live_reasoning_chars": "Max characters of reasoning kept in the browser while a turn streams (trailing window). Prevents tab freezes on long thinking. Default 48000. 0 = unlimited. Full text is still saved server-side and restored after the turn.",
 }
 
 func secretKey(path string) bool {
@@ -178,9 +174,6 @@ func humanize(s string) string {
 func Schema() []Field {
 	var out []Field
 	walk(reflect.ValueOf(*Default()), "", "", &out)
-	for i := range out {
-		out[i].Reload = ReloadMode(out[i].Path)
-	}
 	return out
 }
 
@@ -196,15 +189,16 @@ func walk(v reflect.Value, prefix, group string, out *[]Field) {
 		path := name
 		grp := group
 		fv := v.Field(i)
-		if prefix != "" {
+		switch {
+		case prefix != "":
 			path = prefix + "." + name
 			if hidden[path] {
 				continue
 			}
-		} else if fv.Kind() == reflect.Struct {
+		case fv.Kind() == reflect.Struct:
 			// A struct at the root names its own group; a bare scalar does not.
 			grp = name
-		} else {
+		default:
 			grp = "general"
 		}
 

@@ -3,13 +3,11 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/enowdev/antares/internal/config"
-	"github.com/enowdev/antares/internal/cursor"
 	"github.com/enowdev/antares/internal/llm"
 	"github.com/enowdev/antares/internal/providers"
 )
@@ -23,13 +21,6 @@ func (s *Server) handleProviderModelInfo(w http.ResponseWriter, r *http.Request)
 	modelID := strings.TrimSpace(r.URL.Query().Get("id"))
 	if modelID == "" {
 		writeError(w, http.StatusBadRequest, errors.New("a model id is required"))
-		return
-	}
-	// Agent integrations (Cursor) are not chat-model providers: fail before
-	// the generic agent.Models -> llm.New path. This handler's contract is a
-	// silent fallback (found:false), so no network call is needed either way.
-	if providers.CapabilityOf(s.config(), id) == providers.CapabilityAgent {
-		writeJSON(w, http.StatusOK, map[string]any{"found": false})
 		return
 	}
 	models, err := s.agent.Models(r.Context(), id)
@@ -49,106 +40,6 @@ func (s *Server) handleProviderModelInfo(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"found": false})
-}
-
-// handleProviderModels returns the live model catalogue for an
-// agent-capability provider (Cursor). It never touches cfg.Model and never
-// aggregates into /api/model/list-all — that isolation is what lets Cursor
-// carry its own model picker without disturbing the active chat model.
-// agentProviderModels fetches an agent integration's model catalogue as
-// llm.ModelInfo, so /model/list-all can show it alongside chat models. It does
-// not go through agent.Models: that builds an LLM client, which llm.New
-// deliberately refuses for an agent kind.
-func (s *Server) agentProviderModels(ctx context.Context, id string) ([]llm.ModelInfo, error) {
-	cfg := s.config()
-	if providers.CapabilityOf(cfg, id) != providers.CapabilityAgent {
-		return nil, fmt.Errorf("%s is not an agent integration", id)
-	}
-	_, p := cfg.ResolveProvider(id)
-	key := strings.TrimSpace(p.APIKey)
-	if key == "" {
-		return nil, nil
-	}
-	client, err := s.newCursorMetadataClient(cursor.Options{BaseURL: p.BaseURL, APIKey: key})
-	if err != nil {
-		return nil, err
-	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	catalog, err := client.Models(ctx)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]llm.ModelInfo, 0, len(catalog.Items))
-	for _, m := range catalog.Items {
-		out = append(out, llm.ModelInfo{
-			ID:       m.ID,
-			Name:     firstNonEmpty(m.DisplayName, m.ID),
-			Provider: id,
-			// A cloud agent runs its own loop; it always uses tools, and the
-			// pricing/context fields Cursor reports are per-run, not per-token,
-			// so they are left zero rather than filled with a misleading value.
-			Tools: true,
-		})
-	}
-	return out, nil
-}
-
-func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
-	if s.requireDashboardPassword(w, r) {
-		return
-	}
-	id := r.PathValue("id")
-	cfg := s.config()
-	if providers.CapabilityOf(cfg, id) != providers.CapabilityAgent {
-		writeError(w, http.StatusBadRequest,
-			errors.New("this provider does not expose a dedicated model endpoint"))
-		return
-	}
-
-	_, p := cfg.ResolveProvider(id)
-	key := strings.TrimSpace(p.APIKey)
-	if key == "" {
-		// No resolved credential: report the need without making a network call.
-		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}, "needs_key": true})
-		return
-	}
-
-	client, err := s.newCursorMetadataClient(cursor.Options{BaseURL: p.BaseURL, APIKey: key})
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	catalog, err := client.Models(ctx)
-	if err != nil {
-		if cursor.IsAuthError(err) {
-			writeJSON(w, http.StatusOK, map[string]any{"models": []any{}, "error": err.Error()})
-			return
-		}
-		writeError(w, http.StatusBadGateway, err)
-		return
-	}
-
-	type modelOut struct {
-		ID          string                  `json:"id"`
-		Name        string                  `json:"name"`
-		Description string                  `json:"description"`
-		Parameters  []cursor.ModelParameter `json:"parameters"`
-	}
-	out := make([]modelOut, 0, len(catalog.Items))
-	for _, m := range catalog.Items {
-		params := m.Parameters
-		if params == nil {
-			params = []cursor.ModelParameter{}
-		}
-		out = append(out, modelOut{
-			ID: m.ID, Name: m.DisplayName, Description: m.Description, Parameters: params,
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": out})
 }
 
 // handleContextWindow reports the active model's token budget, so the composer's
@@ -181,8 +72,6 @@ func (s *Server) handleContextWindow(w http.ResponseWriter, r *http.Request) {
 // optional context window stored in model_meta. Manually added models then
 // appear in the model list alongside auto-discovered ones (see agent.Models).
 func (s *Server) handleAddProviderModel(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -204,15 +93,6 @@ func (s *Server) handleAddProviderModel(w http.ResponseWriter, r *http.Request) 
 	cfg, err := config.Reload()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	// Agent integrations (Cursor) do not curate a manual model whitelist —
-	// their catalogue is discovered live via GET /api/providers/{id}/models.
-	// Reject before any config mutation, matching the same boundary as
-	// /api/model/set and /api/model/list.
-	if providers.CapabilityOf(cfg, id) == providers.CapabilityAgent {
-		writeError(w, http.StatusBadRequest, fmt.Errorf(
-			"%s is an agent integration; its models are discovered via GET /api/providers/%s/models", id, id))
 		return
 	}
 	if cfg.Providers == nil {
@@ -251,8 +131,6 @@ func (s *Server) handleAddProviderModel(w http.ResponseWriter, r *http.Request) 
 
 // handleDeleteProviderModel removes a manually added model id (and its meta).
 func (s *Server) handleDeleteProviderModel(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -262,13 +140,6 @@ func (s *Server) handleDeleteProviderModel(w http.ResponseWriter, r *http.Reques
 	cfg, err := config.Reload()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	// Same boundary as handleAddProviderModel: Cursor has no manual model
-	// whitelist to delete from.
-	if providers.CapabilityOf(cfg, id) == providers.CapabilityAgent {
-		writeError(w, http.StatusBadRequest, fmt.Errorf(
-			"%s is an agent integration; its models are discovered via GET /api/providers/%s/models", id, id))
 		return
 	}
 	p := cfg.Providers[id]
@@ -297,14 +168,13 @@ func (s *Server) handleDeleteProviderModel(w http.ResponseWriter, r *http.Reques
 // timeout, and custom headers. Credentials go through the key endpoint; this is
 // everything else a provider entry carries.
 func (s *Server) handleProviderSettings(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
 	id := r.PathValue("id")
 	var body struct {
 		BaseURL     *string           `json:"base_url"`
+		Label       *string           `json:"label"`
 		TimeoutSecs *int              `json:"timeout_seconds"`
 		Headers     map[string]string `json:"headers"`
 	}
@@ -318,22 +188,25 @@ func (s *Server) handleProviderSettings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	p := cfg.Providers[id]
+	// Custom providers (user-named entries, plus the legacy "custom" slot) may
+	// point at loopback or LAN addresses; built-ins keep their catalogue rule.
+	sp := lookupSetupProvider(cfg, id)
+	custom := sp == nil || sp.Custom
+	local := sp != nil && sp.Local
 	if body.BaseURL != nil {
 		baseURL := strings.TrimSpace(*body.BaseURL)
-		allowLocal := false
-		for _, provider := range setupProviderCatalogue(cfg) {
-			if provider.ID == id {
-				allowLocal = provider.Local
-				break
-			}
-		}
 		if baseURL != "" {
-			if err := s.validateProviderBaseURL(r.Context(), baseURL, allowLocal); err != nil {
+			if err := s.validateChosenBaseURL(r.Context(), baseURL, custom, local); err != nil {
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
 		}
 		p.BaseURL = baseURL
+	}
+	if body.Label != nil {
+		if label := strings.TrimSpace(*body.Label); label != "" {
+			p.Label = label
+		}
 	}
 	if body.TimeoutSecs != nil {
 		p.TimeoutSecs = *body.TimeoutSecs
@@ -343,6 +216,126 @@ func (s *Server) handleProviderSettings(w http.ResponseWriter, r *http.Request) 
 	}
 	cfg.Providers[id] = p
 
+	if err := config.Save(cfg); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.applyReload(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleCreateProvider adds a user-defined provider: a name, an
+// OpenAI-compatible base URL, and an optional key. Any number may exist, and
+// loopback/LAN endpoints are accepted — the user is pointing Antares at their
+// own service.
+func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
+	if s.requireDashboardPassword(w, r) {
+		return
+	}
+	var body struct {
+		Name    string `json:"name"`
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("a name is required"))
+		return
+	}
+	baseURL := strings.TrimSpace(body.BaseURL)
+	if baseURL == "" {
+		writeError(w, http.StatusBadRequest, errors.New("a base URL is required"))
+		return
+	}
+	if err := s.validateCustomProviderBaseURL(r.Context(), baseURL); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	cfg, err := config.Reload()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	id := CustomProviderID(cfg, name)
+
+	// Verify the pair now so a bad endpoint or key surfaces at creation time
+	// rather than on the first turn. A keyless service is allowed.
+	key := strings.TrimSpace(body.APIKey)
+	if key != "" {
+		client, err := llm.New(llm.Options{
+			Kind: "openai-compatible", BaseURL: baseURL, APIKey: key,
+			ProviderID: id, Timeout: 30 * time.Second,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		if _, err := client.Models(ctx); err != nil {
+			if llm.IsAuthError(err) {
+				writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			if !llm.IsUnsupported(err) {
+				writeJSON(w, http.StatusBadGateway, map[string]any{
+					"ok": false, "error": "The provider could not be reached or returned an invalid response: " + err.Error(),
+				})
+				return
+			}
+		}
+	}
+
+	cfg.Providers[id] = config.Provider{
+		Kind: "openai-compatible", BaseURL: baseURL, APIKey: key,
+		Enabled: true, Label: name,
+	}
+	if err := config.Save(cfg); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.applyReload(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id})
+}
+
+// handleDeleteProvider removes a user-defined provider. Built-in catalogue
+// entries and the active provider are refused.
+func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
+	if s.requireDashboardPassword(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	// The legacy "custom" slot behaves like any user-defined provider: it can
+	// be deleted. Other built-ins cannot.
+	if isCatalogueProviderID(id) && id != "custom" {
+		writeError(w, http.StatusBadRequest, errors.New("built-in providers cannot be deleted"))
+		return
+	}
+	cfg, err := config.Reload()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if _, ok := cfg.Providers[id]; !ok {
+		writeError(w, http.StatusNotFound, errors.New("unknown provider"))
+		return
+	}
+	if cfg.Model.Provider == id {
+		writeError(w, http.StatusBadRequest, errors.New("this provider is active — pick another model before deleting it"))
+		return
+	}
+	delete(cfg.Providers, id)
 	if err := config.Save(cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

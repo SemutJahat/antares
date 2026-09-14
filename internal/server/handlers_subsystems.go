@@ -22,8 +22,7 @@ var (
 // ---- skills -----------------------------------------------------------------
 
 func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
-	mgr := s.currentSkills()
-	if mgr == nil {
+	if s.skills == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"skills": []any{}})
 		return
 	}
@@ -37,21 +36,20 @@ func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 	category := strings.TrimSpace(r.URL.Query().Get("category"))
 	if q != "" || cwe != "" || tech != "" || category != "" {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"skills":    mgr.SearchFiltered(q, skills.Filter{CWE: cwe, Tech: tech, Category: category}, 100),
+			"skills":    s.skills.SearchFiltered(q, skills.Filter{CWE: cwe, Tech: tech, Category: category}, 100),
 			"searching": true,
-			"library":   mgr.PackCount(),
+			"library":   s.skills.PackCount(),
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"skills":  mgr.Everyday(),
-		"library": mgr.PackCount(),
+		"skills":  s.skills.Everyday(),
+		"library": s.skills.PackCount(),
 	})
 }
 
 func (s *Server) handleToggleSkill(w http.ResponseWriter, r *http.Request) {
-	mgr := s.currentSkills()
-	if mgr == nil {
+	if s.skills == nil {
 		writeError(w, http.StatusServiceUnavailable, errSkillsOff)
 		return
 	}
@@ -63,7 +61,7 @@ func (s *Server) handleToggleSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := mgr.SetEnabled(body.Name, body.Enabled); err != nil {
+	if err := s.skills.SetEnabled(body.Name, body.Enabled); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -71,12 +69,11 @@ func (s *Server) handleToggleSkill(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetSkill(w http.ResponseWriter, r *http.Request) {
-	mgr := s.currentSkills()
-	if mgr == nil {
+	if s.skills == nil {
 		writeError(w, http.StatusServiceUnavailable, errSkillsOff)
 		return
 	}
-	sk, ok := mgr.Get(r.PathValue("name"))
+	sk, ok := s.skills.Get(r.PathValue("name"))
 	if !ok {
 		writeError(w, http.StatusNotFound, errNotFound)
 		return
@@ -85,8 +82,7 @@ func (s *Server) handleGetSkill(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSaveSkill(w http.ResponseWriter, r *http.Request) {
-	mgr := s.currentSkills()
-	if mgr == nil {
+	if s.skills == nil {
 		writeError(w, http.StatusServiceUnavailable, errSkillsOff)
 		return
 	}
@@ -100,7 +96,7 @@ func (s *Server) handleSaveSkill(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	sk, err := mgr.Save(body.Name, body.Description, body.Body, body.Tags)
+	sk, err := s.skills.Save(body.Name, body.Description, body.Body, body.Tags)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -109,12 +105,11 @@ func (s *Server) handleSaveSkill(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
-	mgr := s.currentSkills()
-	if mgr == nil {
+	if s.skills == nil {
 		writeError(w, http.StatusServiceUnavailable, errSkillsOff)
 		return
 	}
-	if err := mgr.Delete(r.PathValue("name")); err != nil {
+	if err := s.skills.Delete(r.PathValue("name")); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -245,8 +240,6 @@ func (s *Server) handleValidateCron(w http.ResponseWriter, r *http.Request) {
 // ---- channels & pairing -----------------------------------------------------
 
 func (s *Server) handleToggleChannel(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	var body struct {
 		Enabled bool `json:"enabled"`
 	}
@@ -373,18 +366,25 @@ func (s *Server) handleMCPStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMCPRefresh(w http.ResponseWriter, r *http.Request) {
-	// Check the concrete pointer before boxing it: a nil *mcp.Manager inside a
-	// non-nil mcpRefresher interface would slip past the nil guard in refreshMCP
-	// and panic on the first field access in Refresh.
-	if s.mcp == nil {
-		s.refreshMCP(w, r, nil)
-		return
+	refresher := s.mcpRefresh
+	if refresher == nil {
+		refresher = s.mcp
 	}
-	s.refreshMCP(w, r, s.mcp)
+	s.refreshMCP(w, r, refresher)
 }
 
 type mcpRefresher interface {
 	Refresh(context.Context, *config.Config) []mcp.ServerStatus
+}
+
+func (s *Server) refreshMCPConnections(ctx context.Context) {
+	refresher := s.mcpRefresh
+	if refresher == nil {
+		refresher = s.mcp
+	}
+	if refresher != nil {
+		refresher.Refresh(ctx, s.config())
+	}
 }
 
 func (s *Server) refreshMCP(w http.ResponseWriter, r *http.Request, refresher mcpRefresher) {
@@ -406,20 +406,19 @@ func (s *Server) refreshMCP(w http.ResponseWriter, r *http.Request, refresher mc
 // handleSkillLibrary browses the bundled security skill library — paged, by
 // category — so thousands of skills are explorable without searching blind.
 func (s *Server) handleSkillLibrary(w http.ResponseWriter, r *http.Request) {
-	mgr := s.currentSkills()
-	if mgr == nil {
+	if s.skills == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"skills": []any{}, "categories": map[string]int{}, "total": 0})
 		return
 	}
 	category := r.URL.Query().Get("category")
 	offset := queryInt(r, "offset", 0)
 	limit := queryInt(r, "limit", 50)
-	page, total := mgr.Library(category, offset, limit)
+	page, total := s.skills.Library(category, offset, limit)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"skills":     page,
 		"total":      total,
 		"offset":     offset,
 		"limit":      limit,
-		"categories": mgr.Categories(),
+		"categories": s.skills.Categories(),
 	})
 }

@@ -7,16 +7,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/enowdev/antares/internal/textutil"
 	"github.com/enowdev/antares/internal/version"
 )
 
@@ -37,6 +41,129 @@ type content struct {
 	// Non-text content is summarised rather than inlined.
 	MimeType string `json:"mimeType,omitempty"`
 	Data     string `json:"data,omitempty"`
+	// Resource holds an embedded resource's own payload. Filesystem, git and
+	// docs servers answer with these rather than with plain text.
+	Resource *resourceContents `json:"resource,omitempty"`
+}
+
+// resourceContents is a resource's payload: inline text or base64 bytes. Both
+// an embedded resource in a tool result and a resources/read reply use it.
+//
+// Text and Blob are pointers because an empty file is a legal payload. A server
+// answering with "text": "" has represented an empty document exactly; only a
+// resource carrying neither key is one this client cannot read.
+type resourceContents struct {
+	URI      string  `json:"uri"`
+	MimeType string  `json:"mimeType"`
+	Text     *string `json:"text"`
+	Blob     *string `json:"blob"`
+}
+
+// hasPayload reports whether the server sent a payload at all, empty or not.
+func (r resourceContents) hasPayload() bool { return r.Text != nil || r.Blob != nil }
+
+// describe names a resource for a summary line.
+func (r resourceContents) describe() string {
+	uri := r.URI
+	if uri == "" {
+		uri = "no uri"
+	}
+	return fmt.Sprintf("%s (%s)", uri, mimeOrUnknown(r.MimeType))
+}
+
+// render returns the text this resource contributes, which is empty for an
+// empty file. Text wins over bytes only when it has something in it: a server
+// marshalling both keys sends "text": "" with every binary resource, and an
+// empty string must not hide the bytes sent beside it. Bytes are named rather
+// than inlined: the model cannot use base64 and it would crowd out the context.
+func (r resourceContents) render() string {
+	switch {
+	case r.Text != nil && *r.Text != "":
+		return *r.Text
+	case r.Blob != nil && *r.Blob != "":
+		return fmt.Sprintf("[resource: %s, %d bytes base64]", r.describe(), len(*r.Blob))
+	default:
+		return ""
+	}
+}
+
+// mimeOrUnknown names a media type for a summary line. Leaving it out would
+// read as though the server had stated one.
+func mimeOrUnknown(mime string) string {
+	if mime == "" {
+		return "unknown type"
+	}
+	return mime
+}
+
+// contentKindChars bounds one content type named back in an error message, and
+// maxContentKinds bounds how many are named. Both come from the server.
+const (
+	contentKindChars = 40
+	maxContentKinds  = 5
+)
+
+// flattenContent renders a tool result to text and reports the kinds of content
+// it could not represent. The two are kept apart because "the server said
+// nothing" and "the server said something this client cannot read" call for
+// different answers to the model.
+//
+// Text, images and embedded resources are the three kinds this client has
+// rendering code for. Everything else is named back to the caller rather than
+// dropped. An item of a kind it does understand but that carries nothing —
+// an empty file, an empty string — is understood and simply has nothing to
+// show, which is not the same as unreadable.
+func flattenContent(items []content) (string, []string) {
+	var b strings.Builder
+	var skipped []string
+	unnamed := 0
+	seen := map[string]bool{}
+	skip := func(kind string) {
+		kind = textutil.TruncateRunes(kind, contentKindChars)
+		if seen[kind] {
+			return
+		}
+		seen[kind] = true
+		if len(skipped) >= maxContentKinds {
+			unnamed++
+			return
+		}
+		skipped = append(skipped, kind)
+	}
+
+	for _, item := range items {
+		switch item.Type {
+		case "text":
+			b.WriteString(item.Text)
+			b.WriteString("\n")
+		case "image":
+			// No bytes is not an empty image, it is not an image at all: a
+			// zero-byte summary line would be this client's assertion rather
+			// than the server's.
+			if item.Data == "" {
+				skip("image with no data")
+				continue
+			}
+			fmt.Fprintf(&b, "[image: %s, %d bytes base64]\n", mimeOrUnknown(item.MimeType), len(item.Data))
+		case "resource":
+			if item.Resource == nil || !item.Resource.hasPayload() {
+				skip("resource with no text or blob")
+				continue
+			}
+			if line := item.Resource.render(); line != "" {
+				b.WriteString(line)
+				b.WriteString("\n")
+			}
+		case "":
+			skip("item with no type")
+		default:
+			skip(item.Type)
+		}
+	}
+	if unnamed > 0 {
+		skipped = append(skipped, fmt.Sprintf("and %d more", unnamed))
+	}
+	return strings.TrimSpace(b.String()), skipped
 }
 
 // CallResult is the outcome of calling an MCP tool.
@@ -55,10 +182,11 @@ type rpcRequest struct {
 
 // rpcResponse is a JSON-RPC 2.0 response.
 type rpcResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      *int64          `json:"id"`
-	Result  json.RawMessage `json:"result"`
-	Error   *rpcError       `json:"error"`
+	JSONRPC      string          `json:"jsonrpc"`
+	ID           *int64          `json:"id"`
+	Result       json.RawMessage `json:"result"`
+	Error        *rpcError       `json:"error"`
+	transportErr error
 }
 
 type rpcError struct {
@@ -253,20 +381,15 @@ func (c *Client) Call(ctx context.Context, tool string, args map[string]any) (*C
 		return nil, fmt.Errorf("decode tool result: %w", err)
 	}
 
-	var b strings.Builder
-	for _, item := range out.Content {
-		switch item.Type {
-		case "text":
-			b.WriteString(item.Text)
-			b.WriteString("\n")
-		case "image":
-			fmt.Fprintf(&b, "[image: %s, %d bytes base64]\n", item.MimeType, len(item.Data))
-		case "resource":
-			fmt.Fprintf(&b, "[resource: %s]\n", item.MimeType)
-		}
-	}
-	text := strings.TrimSpace(b.String())
+	text, skipped := flattenContent(out.Content)
 	if text == "" {
+		// Nothing renderable came back. If the server did send something, say
+		// what it was: reporting it as an empty success would tell the model the
+		// tool ran and had nothing to report, so it proceeds instead of retrying.
+		if len(skipped) > 0 {
+			return nil, fmt.Errorf("tool %q returned only content this client cannot represent: %s",
+				tool, strings.Join(skipped, ", "))
+		}
 		text = "(no content returned)"
 	}
 	return &CallResult{Text: text, IsError: out.IsError}, nil
@@ -318,23 +441,22 @@ func (c *Client) ReadResource(ctx context.Context, uri string) (string, error) {
 		return "", resp.Error
 	}
 	var out struct {
-		Contents []struct {
-			URI      string `json:"uri"`
-			MimeType string `json:"mimeType"`
-			Text     string `json:"text"`
-			Blob     string `json:"blob"`
-		} `json:"contents"`
+		Contents []resourceContents `json:"contents"`
 	}
 	if err := json.Unmarshal(resp.Result, &out); err != nil {
 		return "", err
 	}
+	// No contents at all is this server saying it does not hold the resource.
+	// Manager.ReadResource asks one server after another, so this has to be an
+	// error for the search to continue past the first server that lacks it.
+	if len(out.Contents) == 0 {
+		return "", fmt.Errorf("server %q has no resource with uri %q", c.name, uri)
+	}
 	var b strings.Builder
 	for _, part := range out.Contents {
-		if part.Text != "" {
-			b.WriteString(part.Text)
+		if line := part.render(); line != "" {
+			b.WriteString(line)
 			b.WriteString("\n")
-		} else if part.Blob != "" {
-			fmt.Fprintf(&b, "[binary resource: %s, %d bytes base64]\n", part.MimeType, len(part.Blob))
 		}
 	}
 	text := strings.TrimSpace(b.String())
@@ -386,7 +508,35 @@ type stdioTransport struct {
 	// otherwise make every future call wait the full timeout forever. After
 	// maxConsecutiveTimeouts the transport self-closes so the next caller fails
 	// fast and the process is reaped. Any successful reply resets it to zero.
-	timeouts int
+	timeouts   int
+	stderr     stderrCapture
+	stderrDone chan struct{} // closed when the stderr scanner has drained the pipe
+	exited     chan struct{} // closed once the child has been waited on
+	readerErr  error
+}
+
+type stderrCapture struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+const maxStderrBytes = 16 << 10
+
+func (c *stderrCapture) append(line string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.buf = append(c.buf, line...)
+	c.buf = append(c.buf, '\n')
+	if len(c.buf) > maxStderrBytes {
+		copy(c.buf, c.buf[len(c.buf)-maxStderrBytes:])
+		c.buf = c.buf[:maxStderrBytes]
+	}
+}
+
+func (c *stderrCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.TrimSpace(string(c.buf))
 }
 
 // maxConsecutiveTimeouts is how many back-to-back ctx.Done timeouts a stdio
@@ -397,7 +547,7 @@ func newStdioTransport(cfg ServerConfig) (transport, error) {
 	if strings.TrimSpace(cfg.Command) == "" {
 		return nil, fmt.Errorf("stdio transport needs a command")
 	}
-	cmd := exec.Command(cfg.Command, cfg.Args...)
+	cmd := exec.Command(cfg.Command, expandArgs(cfg.Args)...)
 	cmd.Env = os.Environ()
 	for k, v := range cfg.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
@@ -412,31 +562,79 @@ func newStdioTransport(cfg ServerConfig) (transport, error) {
 		return nil, err
 	}
 	// Server logs go to stderr; surface them at debug level rather than dropping.
-	stderr, err := cmd.StderrPipe()
+	// This is a pipe we own rather than cmd.StderrPipe because Wait closes the
+	// pipes it hands out, and reaping the child would then race the scanner and
+	// truncate exactly the diagnostics we report when a server dies at startup.
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
+	cmd.Stderr = stderrW
 	if err := cmd.Start(); err != nil {
+		stderrR.Close()
+		stderrW.Close()
 		return nil, fmt.Errorf("start %s: %w", cfg.Command, err)
 	}
-	go func() {
-		sc := bufio.NewScanner(stderr)
-		for sc.Scan() {
-			slog.Debug("mcp server stderr", "command", cfg.Command, "line", sc.Text())
-		}
-	}()
-
+	// Drop the parent's writer so the child holds the only one and the scanner
+	// sees EOF when it exits.
+	stderrW.Close()
 	t := &stdioTransport{
 		cmd:        cmd,
 		stdin:      stdin,
 		stdout:     bufio.NewReaderSize(stdout, 1<<20),
 		pending:    map[int64]chan *rpcResponse{},
 		readerDone: make(chan struct{}),
+		stderrDone: make(chan struct{}),
+		exited:     make(chan struct{}),
 	}
+	go func() {
+		defer close(t.stderrDone)
+		defer stderrR.Close()
+		sc := bufio.NewScanner(stderrR)
+		for sc.Scan() {
+			t.stderr.append(sc.Text())
+			slog.Debug("mcp server stderr", "command", cfg.Command, "line", sc.Text())
+		}
+	}()
 	// Reap the child if it exits on its own so it never sits as a zombie until
 	// the next Close/Refresh. Wait is idempotent via waitOnce.
-	go func() { _ = t.reap() }()
+	go func() {
+		defer close(t.exited)
+		_ = t.reap()
+	}()
 	return t, nil
+}
+
+// envRef matches only the ${NAME} form the catalogue uses. Bare $NAME is left
+// alone so arguments holding a literal dollar sign — passwords, regexes,
+// connection strings — survive verbatim.
+var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+func expandArgs(args []string) []string {
+	home, _ := os.UserHomeDir()
+	out := make([]string, len(args))
+	for i, arg := range args {
+		arg = envRef.ReplaceAllStringFunc(arg, func(ref string) string {
+			key := ref[2 : len(ref)-1]
+			if v, ok := os.LookupEnv(key); ok {
+				return v
+			}
+			if key == "HOME" {
+				return home
+			}
+			// An undefined variable stays literal; collapsing it to an empty
+			// string would silently hand the server a wrong path.
+			return ref
+		})
+		switch {
+		case arg == "~":
+			arg = home
+		case strings.HasPrefix(arg, "~/"), strings.HasPrefix(arg, `~\`):
+			arg = filepath.Join(home, arg[2:])
+		}
+		out[i] = arg
+	}
+	return out
 }
 
 func (t *stdioTransport) reap() error {
@@ -496,14 +694,16 @@ func (t *stdioTransport) startReader() {
 }
 
 // failPending delivers an error to every waiting caller and clears the map.
-func (t *stdioTransport) failPending(err error) {
+func (t *stdioTransport) failPending(readErr error) {
+	err := t.processError(readErr)
 	t.pendingMu.Lock()
+	t.readerErr = err
 	for id, ch := range t.pending {
 		// Non-blocking: the caller may have already returned on ctx.Done and
 		// stopped reading. The channel is buffered(1), so a live caller still
 		// receives this; an abandoned one must not wedge the reader goroutine.
 		select {
-		case ch <- &rpcResponse{Error: &rpcError{Message: err.Error()}}:
+		case ch <- &rpcResponse{transportErr: err}:
 		default:
 		}
 		delete(t.pending, id)
@@ -511,26 +711,51 @@ func (t *stdioTransport) failPending(err error) {
 	t.pendingMu.Unlock()
 }
 
+// exitGrace bounds how long a failed read waits for the child's exit status and
+// stderr tail. A server that closed stdout but kept running must not wedge the
+// reader goroutine, which still has to close readerDone so callers fail fast.
+const exitGrace = 2 * time.Second
+
+func (t *stdioTransport) processError(readErr error) error {
+	grace := time.After(exitGrace)
+	select {
+	case <-t.exited:
+	case <-grace:
+		return errors.New("MCP server closed stdout while still running")
+	}
+	select {
+	case <-t.stderrDone:
+	case <-grace:
+	}
+	waitErr := t.reap()
+	stderr := t.stderr.String()
+	switch {
+	case waitErr != nil && stderr != "":
+		return fmt.Errorf("MCP server exited (%v): %s", waitErr, stderr)
+	case waitErr != nil:
+		return fmt.Errorf("MCP server exited: %w", waitErr)
+	case stderr != "":
+		return fmt.Errorf("MCP server closed stdout: %s", stderr)
+	case readErr != nil && !errors.Is(readErr, io.EOF):
+		return fmt.Errorf("MCP server output failed: %w", readErr)
+	default:
+		return errors.New("MCP server exited before replying")
+	}
+}
+
 func (t *stdioTransport) send(ctx context.Context, req rpcRequest) (*rpcResponse, error) {
 	// One in-flight request at a time — required for line-delimited stdio.
 	t.sendMu.Lock()
 	defer t.sendMu.Unlock()
 
-	t.mu.Lock()
-	if t.closed {
-		t.mu.Unlock()
-		return nil, fmt.Errorf("mcp connection closed")
-	}
-	err := t.writeFrame(req)
-	t.mu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-
-	// Register a per-call response channel keyed by request ID, then start
-	// (or reuse) the single background reader. On ctx.Done the entry is
-	// removed so any late reply is discarded by ID mismatch — the transport
-	// stays alive for subsequent calls.
+	// Register a per-call response channel keyed by request ID *before* the
+	// frame goes out. From the second call onward the background reader is
+	// already running, so a server that answers while the write is still
+	// returning would have its reply looked up against an ID the map does not
+	// hold yet, and the reader would discard it as stale; the caller then waits
+	// out its whole deadline for an answer that already arrived. A registration
+	// made first is never too late: the reader cannot see a reply to a request
+	// that has not been written.
 	ch := make(chan *rpcResponse, 1)
 	t.pendingMu.Lock()
 	if t.pending == nil {
@@ -538,14 +763,33 @@ func (t *stdioTransport) send(ctx context.Context, req rpcRequest) (*rpcResponse
 	}
 	t.pending[req.ID] = ch
 	t.pendingMu.Unlock()
-	t.startReader()
-
-	// Ensure the entry is cleaned up no matter how we exit.
-	defer func() {
+	unregister := func() {
 		t.pendingMu.Lock()
 		delete(t.pending, req.ID)
 		t.pendingMu.Unlock()
-	}()
+	}
+
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		unregister()
+		return nil, fmt.Errorf("mcp connection closed")
+	}
+	err := t.writeFrame(req)
+	t.mu.Unlock()
+	if err != nil {
+		// Nothing will ever answer a frame that did not go out.
+		unregister()
+		return nil, err
+	}
+
+	// Start (or reuse) the single background reader. On ctx.Done the entry is
+	// removed so any late reply is discarded by ID mismatch — the transport
+	// stays alive for subsequent calls.
+	t.startReader()
+
+	// Ensure the entry is cleaned up no matter how we exit.
+	defer unregister()
 
 	select {
 	case <-ctx.Done():
@@ -563,9 +807,19 @@ func (t *stdioTransport) send(ctx context.Context, req rpcRequest) (*rpcResponse
 		}
 		return nil, ctx.Err()
 	case <-t.readerDone:
-		// The background reader exited (EOF, child died). Surface the failure.
-		return nil, fmt.Errorf("mcp connection lost")
+		// The background reader exited (EOF, child died). Surface its exit status
+		// and bounded stderr tail instead of reducing every startup crash to EOF.
+		t.pendingMu.Lock()
+		err := t.readerErr
+		t.pendingMu.Unlock()
+		if err == nil {
+			err = errors.New("MCP server connection lost")
+		}
+		return nil, err
 	case r := <-ch:
+		if r.transportErr != nil {
+			return nil, r.transportErr
+		}
 		t.pendingMu.Lock()
 		t.timeouts = 0
 		t.pendingMu.Unlock()

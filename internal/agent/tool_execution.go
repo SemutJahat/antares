@@ -21,6 +21,30 @@ type toolOutcome struct {
 	isError bool
 }
 
+// appendTurnMessages assembles the tail of one turn: every tool result first,
+// then the repetition nudge, then any steering note. The order is the whole
+// point. A user message sitting between an assistant's tool_calls and their
+// results is not a valid transcript, and ensureToolResults repairing it at send
+// time is no reason to write it — the repair is silent, so a nudge that drifts
+// back above the results would leave every test green while the transcript we
+// build is wrong. Keeping the order in one pure function is what makes it
+// assertable without a client, a store or a server.
+func appendTurnMessages(history []llm.Message, results []toolOutcome, nudge string, notes []string) []llm.Message {
+	for _, r := range results {
+		history = append(history, r.message)
+	}
+	if nudge != "" {
+		history = append(history, llm.Message{Role: llm.RoleUser, Content: nudge})
+	}
+	for _, note := range notes {
+		history = append(history, llm.Message{
+			Role:    llm.RoleUser,
+			Content: "A new instruction arrived while you were working: " + note,
+		})
+	}
+	return history
+}
+
 // executeTools runs the requested calls, in parallel when the config allows.
 func (a *Agent) executeTools(
 	ctx context.Context,
@@ -226,7 +250,7 @@ func (a *Agent) executeTools(
 		// What the model sees may be fenced as untrusted; what the UI shows stays
 		// raw. Errors are our own messages, so they are never fenced.
 		modelContent := content
-		if !res.IsError && a.config().Agent.WrapUntrustedOutput && untrustedTool(call.Name) {
+		if !res.IsError && a.config().Agent.WrapUntrustedOutput && untrustedTool(tool) {
 			modelContent = wrapUntrusted(call.Name, content)
 		}
 

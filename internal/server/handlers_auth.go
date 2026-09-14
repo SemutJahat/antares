@@ -188,8 +188,6 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAuthSetPassword(w http.ResponseWriter, r *http.Request) {
 	s.passwordMu.Lock()
 	defer s.passwordMu.Unlock()
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 
 	var body struct {
 		Current  string `json:"current"`  // required once a password is already set
@@ -206,17 +204,14 @@ func (s *Server) handleAuthSetPassword(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnauthorized, errors.New("current password required"))
 			return
 		}
-	} else if !s.bearerAuthorized(r) && !(requestIsLoopback(r) && requestIsSameOriginBrowser(r)) {
-		// The first password is a bootstrap capability. It must not be reachable
-		// by a cross-origin drive-by fetch from any page running in the
-		// operator's browser — such a request is loopback, but Sec-Fetch-Site
-		// reveals it as cross-site. Non-browser callers (curl, the CLI) do not
-		// send the header and are still accepted on loopback.
-		writeError(w, http.StatusForbidden, errors.New("the first dashboard password must be set from a same-origin loopback client or with a configured bearer token"))
+	} else if !requestIsLoopback(r) && !s.bearerAuthorized(r) {
+		// The first password is a bootstrap capability. Without this check the
+		// first network client wins a race and can lock out the owner (or claim
+		// the dashboard when no bearer token is configured).
+		writeError(w, http.StatusForbidden, errors.New("the first dashboard password must be set from loopback or with a configured bearer token"))
 		return
 	}
 
-	cfg = config.Get()
 	next := strings.TrimSpace(body.Password)
 	if next == "" {
 		cfg.Server.DashboardPasswordHash = ""
@@ -227,11 +222,6 @@ func (s *Server) handleAuthSetPassword(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg.Server.DashboardPasswordHash = hash
-	}
-	effective, _ := config.Effective(s.config(), cfg)
-	if err := effective.Server.ValidateListen(); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
 	}
 	if err := config.Save(cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, err)

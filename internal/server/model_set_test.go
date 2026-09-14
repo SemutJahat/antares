@@ -14,6 +14,88 @@ import (
 	"github.com/enowdev/antares/internal/config"
 )
 
+// TestModelSetSwapsBothConfigPointers guards the regression where
+// handleModelSet updated only the agent's config pointer (via
+// s.agent.SetConfig) and skipped the server's (s.SetConfig). The skipped
+// server pointer left /api/model/options, /api/model/list-all, and
+// /api/status reporting the stale "active" model — so the dashboard
+// picker appeared to stick on the previous model even though the switch
+// returned 200. applyReload (the pre-FR-004 path) updated both pointers;
+// the FR-004 optimization that replaced it with a direct swap must
+// preserve that invariant.
+//
+// The handler also spawns an async config.SaveAt goroutine. We use a
+// manual temp dir (not t.TempDir) and wait for the save to land before
+// returning so the goroutine never outlives the test's environment and
+// cannot race the cleanup.
+func TestModelSetSwapsBothConfigPointers(t *testing.T) {
+	// Isolate the config package global cache + on-disk file from the user's
+	// real ~/.antares. Reload() inside handleModelSet and the async Save
+	// goroutine both touch the package state and the config file.
+	home := t.TempDir()
+	t.Setenv("ANTARES_HOME", home)
+	configFile := config.ConfigFile()
+
+	cfg := config.Default()
+	// The dashboard-password gate (upstream PR #17) is kept: satisfy it with a
+	// set password hash so the handler reaches its actual logic. The bearer
+	// token below is belt-and-braces.
+	cfg.Server.DashboardPasswordHash = "test-hash"
+	cfg.Server.AuthToken = "test-token"
+	cfg.Model.Default = "model-a"
+	cfg.Model.Provider = "prov-a"
+
+	// Seed the file the way newModelSetServer does: writing via SaveAt (rather
+	// than letting Reload's first-run branch create it) keeps the on-disk
+	// state explicit and sidesteps the Windows rename-after-first-run quirk.
+	if err := config.SaveAt(configFile, cfg); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	s := &Server{cfg: cfg}
+	s.agent = &agent.Agent{}
+	s.agent.SetConfig(cfg) // align the agent pointer with the server's
+
+	body := strings.NewReader(`{"model":"model-b","provider":"prov-b"}`)
+	r := httptest.NewRequest(http.MethodPost, "/api/model/set", body)
+	r.Header.Set("Authorization", "Bearer test-token")
+	rr := httptest.NewRecorder()
+	s.handleModelSet(rr, r)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("handleModelSet status = %d, want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+
+	// The fix: the SERVER config pointer must reflect the swap so the
+	// /api/model/options, list-all, and status handlers (which read
+	// s.config()) report the new active model immediately.
+	serverCfg := s.config()
+	if serverCfg.Model.Default != "model-b" {
+		t.Fatalf("server config default = %q, want %q (stale server pointer)",
+			serverCfg.Model.Default, "model-b")
+	}
+	if serverCfg.Model.Provider != "prov-b" {
+		t.Fatalf("server config provider = %q, want %q", serverCfg.Model.Provider, "prov-b")
+	}
+
+	// The agent pointer (already updated pre-fix) must remain aligned and
+	// point at the SAME config struct the server now holds, so a chat turn
+	// with no per-turn override resolves to the just-selected model.
+	agentCfg := s.agent.Config()
+	if agentCfg != serverCfg {
+		t.Fatal("agent and server config pointers diverge after model switch")
+	}
+	if agentCfg.Model.Default != "model-b" {
+		t.Fatalf("agent config default = %q, want %q", agentCfg.Model.Default, "model-b")
+	}
+
+	// Wait for the async SaveAt goroutine to land the persist at the captured
+	// path. This bounds the goroutine's lifetime to the test so it cannot
+	// outlive the ANTARES_HOME override (which would clobber the real config)
+	// and cannot race the temp-dir cleanup.
+	waitForModelSave(t, configFile, "model-b")
+}
+
 // ---- handleModelSet edge cases --------------------------
 
 // newModelSetServer seeds an isolated ANTARES_HOME with the given config and

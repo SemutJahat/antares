@@ -22,7 +22,6 @@ import (
 	"github.com/enowdev/antares/internal/agent"
 	"github.com/enowdev/antares/internal/config"
 	"github.com/enowdev/antares/internal/cron"
-	"github.com/enowdev/antares/internal/cursor"
 	"github.com/enowdev/antares/internal/gateway"
 	"github.com/enowdev/antares/internal/mcp"
 	"github.com/enowdev/antares/internal/skills"
@@ -31,47 +30,31 @@ import (
 	"github.com/enowdev/antares/internal/version"
 )
 
-// cursorMetadataClient is the narrow surface Server needs from a Cursor
-// client: identity/quota verification and the model catalogue. Tests inject a
-// fake through cursorFactory; production always goes through cursor.New.
-type cursorMetadataClient interface {
-	Me(context.Context) (*cursor.Me, error)
-	Models(context.Context) (*cursor.ModelCatalog, error)
-}
-
-// cursorClientFactory builds a cursorMetadataClient from connection options.
-type cursorClientFactory func(cursor.Options) (cursorMetadataClient, error)
-
 // Server wires the API handlers to the agent and store.
 type Server struct {
-	cfg     *config.Config
-	agent   *agent.Agent
-	db      store.Store
-	skills  *skills.Manager
-	cron    *cron.Runner
-	gateway *gateway.Manager
-	mcp     *mcp.Manager
-	social  *socialbrowser.Manager
-	mux     *http.ServeMux
-	hub     *liveHub
-	wake    *wakeQueue
-	started time.Time
+	cfg        *config.Config
+	agent      *agent.Agent
+	db         store.Store
+	skills     *skills.Manager
+	cron       *cron.Runner
+	gateway    *gateway.Manager
+	mcp        *mcp.Manager
+	mcpRefresh mcpRefresher
+	social     *socialbrowser.Manager
+	mux        *http.ServeMux
+	hub        *liveHub
+	wake       *wakeQueue
+	started    time.Time
 
 	// distFS holds the embedded dashboard build, when present.
 	distFS fs.FS
-
-	// cursorFactory overrides how a Cursor metadata client is constructed.
-	// Only tests set this; production callers get cursor.New via
-	// newCursorMetadataClient.
-	cursorFactory cursorClientFactory
 
 	// providerResolver overrides provider hostname resolution in handler tests.
 	// Production uses net.DefaultResolver.
 	providerResolver providerIPResolver
 
-	mu            sync.RWMutex
-	configWriteMu sync.Mutex
-	reloadFn      func() error
+	mu       sync.RWMutex
+	reloadFn func() error
 
 	// dashSessions holds active dashboard login session tokens (cookie value →
 	// expiry). Guarded by its own mutex; cleared when the password changes.
@@ -130,13 +113,8 @@ func New(o Options) *Server {
 	// instead of the main agent polling for them.
 	if s.agent != nil {
 		s.agent.OnBackgroundDone(s.onBackgroundDone)
-		// A confident autonomous goal drives its own next turn when one ends.
-		s.agent.OnTurnEnd(s.onTurnEnd)
 	}
 	s.routes()
-	// Resume any confident autonomous goals left running from before a restart,
-	// so an unattended goal survives the server going down and coming back.
-	s.resumeAutonomousGoals()
 	return s
 }
 
@@ -147,11 +125,11 @@ func (s *Server) Handler() http.Handler {
 
 // Addr returns the configured listen address.
 func (s *Server) Addr() string {
-	host := s.config().Server.Host
+	host := s.cfg.Server.Host
 	if host == "" {
-		host = "127.0.0.1"
+		host = "0.0.0.0"
 	}
-	return net.JoinHostPort(host, strconv.Itoa(s.config().Server.Port))
+	return net.JoinHostPort(host, strconv.Itoa(s.cfg.Server.Port))
 }
 
 // SetConfig swaps the live configuration after a reload.
@@ -165,15 +143,6 @@ func (s *Server) config() *config.Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.cfg
-}
-
-// newCursorMetadataClient builds a Cursor metadata client, honouring an
-// injected test factory when one is set. No production caller injects one.
-func (s *Server) newCursorMetadataClient(o cursor.Options) (cursorMetadataClient, error) {
-	if s.cursorFactory != nil {
-		return s.cursorFactory(o)
-	}
-	return cursor.New(o)
 }
 
 //go:embed all:dist
@@ -317,10 +286,6 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if cfg.Server.DashboardLocked() && s.dashSessionValid(r) {
-			next.ServeHTTP(w, r)
-			return
-		}
 
 		presented := ""
 		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
@@ -425,9 +390,6 @@ func (s *sseWriter) comment(text string) {
 
 // Serve runs the HTTP server until ctx is cancelled.
 func (s *Server) Serve(ctx context.Context) error {
-	if err := s.config().Server.ValidateListen(); err != nil {
-		return err
-	}
 	srv := &http.Server{
 		Addr:              s.Addr(),
 		Handler:           s.Handler(),

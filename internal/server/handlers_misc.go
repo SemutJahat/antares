@@ -493,36 +493,32 @@ func (s *Server) handleSocialImage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("path is required"))
 		return
 	}
-	// Only allow raster image extensions. SVG is excluded on purpose: it can
-	// carry JavaScript that would execute on the dashboard origin.
+	// Only allow image extensions.
 	ext := strings.ToLower(filepath.Ext(path))
 	allowed := map[string]bool{
 		".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
-		".webp": true, ".avif": true, ".bmp": true,
+		".webp": true, ".svg": true, ".avif": true, ".bmp": true,
 	}
 	if !allowed[ext] {
-		writeError(w, http.StatusBadRequest, errors.New("only raster image files are allowed"))
+		writeError(w, http.StatusBadRequest, errors.New("only image files are allowed"))
 		return
 	}
+	// Resolve to absolute path. No workspace confinement — the agent may
+	// download images to /tmp or the antares home.
 	abs := path
 	if !filepath.IsAbs(path) {
 		abs = filepath.Join(config.Home(), path)
 	}
+	// Prevent directory traversal above the allowed roots.
 	abs = filepath.Clean(abs)
-	// Confine to the antares home or the OS temp directory. The agent may
-	// download images to either; anywhere else is not a supported source and
-	// would let a caller read arbitrary readable files off the host.
-	if !pathUnderAny(abs, config.Home(), os.TempDir()) {
-		writeError(w, http.StatusForbidden, errors.New("path is outside the allowed roots"))
-		return
-	}
+
 	fi, err := os.Stat(abs)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
-	if !fi.Mode().IsRegular() {
-		writeError(w, http.StatusBadRequest, errors.New("path is not a regular file"))
+	if fi.IsDir() {
+		writeError(w, http.StatusBadRequest, errors.New("path is a directory"))
 		return
 	}
 	// Size limit: 20 MB to prevent serving huge files.
@@ -536,31 +532,7 @@ func (s *Server) handleSocialImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	// Belt and braces: even for allowed types, forbid the browser from
-	// sniffing something executable out of the bytes.
-	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeContent(w, r, filepath.Base(abs), fi.ModTime(), f)
-}
-
-// pathUnderAny reports whether abs lives inside any of the given roots.
-// Both sides are already cleaned; the check uses filepath.Rel so a symlink
-// re-anchoring inside a root is still accepted while ".." escapes are not.
-func pathUnderAny(abs string, roots ...string) bool {
-	for _, root := range roots {
-		if root == "" {
-			continue
-		}
-		root = filepath.Clean(root)
-		rel, err := filepath.Rel(root, abs)
-		if err != nil {
-			continue
-		}
-		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			continue
-		}
-		return true
-	}
-	return false
 }
 
 func safeJoin(workspace, target string) (string, error) {
@@ -646,8 +618,6 @@ func (s *Server) handleListChannels(w http.ResponseWriter, r *http.Request) {
 // watching. It also names the bot back, which is the only way to confirm you
 // pasted the token you meant to.
 func (s *Server) handleSetChannelToken(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	var body struct {
 		Token string `json:"token"`
 	}

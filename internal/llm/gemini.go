@@ -375,35 +375,11 @@ func (c *geminiClient) endpoint(model, method string, stream bool) string {
 // use thinkingBudget token counts. includeThoughts requests thought summaries
 // when the endpoint exposes them (not all reverse proxies return thought text).
 func geminiThinkingConfig(model, effort string) map[string]any {
-	e := strings.ToLower(strings.TrimSpace(effort))
-	if e == "" {
+	enc := OfficialReasoning("gemini", "", model).Encode(effort)
+	if enc.Omit || len(enc.GeminiThinking) == 0 {
 		return nil
 	}
-	useLevel := geminiModelUsesThinkingLevel(model)
-	switch e {
-	case "none":
-		if useLevel {
-			return map[string]any{"thinkingLevel": "MINIMAL", "includeThoughts": false}
-		}
-		return map[string]any{"thinkingBudget": 0}
-	case "low":
-		if useLevel {
-			return map[string]any{"thinkingLevel": "LOW", "includeThoughts": true}
-		}
-		return map[string]any{"thinkingBudget": 2048, "includeThoughts": true}
-	case "medium":
-		if useLevel {
-			return map[string]any{"thinkingLevel": "MEDIUM", "includeThoughts": true}
-		}
-		return map[string]any{"thinkingBudget": 8192, "includeThoughts": true}
-	case "high":
-		if useLevel {
-			return map[string]any{"thinkingLevel": "HIGH", "includeThoughts": true}
-		}
-		return map[string]any{"thinkingBudget": 24576, "includeThoughts": true}
-	default:
-		return nil
-	}
+	return enc.GeminiThinking
 }
 
 func geminiModelUsesThinkingLevel(model string) bool {
@@ -529,10 +505,13 @@ func (c *geminiClient) Stream(ctx context.Context, req Request, emit func(Event)
 			for _, p := range cand.Content.Parts {
 				switch {
 				case p.FunctionCall != nil:
+					// Report the payload that arrived and nothing more. A call
+					// with no args is either a parameterless tool or a stream
+					// that stopped before the arguments; the finishReason check
+					// below is what tells those apart, and filling in {} here
+					// would hand on a dispatchable call the model never
+					// finished asking for.
 					args := string(p.FunctionCall.Args)
-					if strings.TrimSpace(args) == "" {
-						args = "{}"
-					}
 					id := p.FunctionCall.ID
 					if id == "" {
 						id = fmt.Sprintf("call_%d_%s", callSeq, p.FunctionCall.Name)
@@ -586,6 +565,15 @@ func (c *geminiClient) Stream(ctx context.Context, req Request, emit func(Event)
 	})
 	if err != nil {
 		return nil, err
+	}
+	// The candidate's finishReason is Gemini's terminal marker. Parts arrive
+	// whole rather than as fragments, so nothing inside a chunk can show that
+	// the answer stopped early — a gateway that loses its upstream closes the
+	// body cleanly after a perfectly well-formed functionCall. Only the absence
+	// of a finishReason says the answer was cut, and every caller downstream
+	// treats what this returns as a stream the adapter has vouched for.
+	if finish == "" {
+		return nil, fmt.Errorf("%w: the stream ended without a finishReason", ErrStreamTruncated)
 	}
 	// If a functionCall arrived without a signature, inject the CLI dummy so
 	// the next turn does not 400. Prefer part-level sig already stored.

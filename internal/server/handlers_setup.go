@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/enowdev/antares/internal/config"
-	"github.com/enowdev/antares/internal/cursor"
 	"github.com/enowdev/antares/internal/llm"
 	"github.com/enowdev/antares/internal/store"
 )
@@ -30,11 +29,6 @@ type setupProvider struct {
 	Local   bool     `json:"local"`
 	Models  []string `json:"models,omitempty"`
 	HasKey  bool     `json:"has_key"`
-	// Capability distinguishes chat-model providers ("llm") from agent
-	// integrations ("agent", e.g. Cursor). Only "llm" providers are eligible
-	// for initial onboarding and the active model — see setupProviderCatalogue,
-	// handleSetupStatus, and handleSetupComplete.
-	Capability string `json:"capability"`
 	// KeyLabel overrides the "API key" label (e.g. "Service account JSON").
 	KeyLabel string `json:"key_label,omitempty"`
 	// Note is an extra line shown under the form (e.g. how creds are supplied).
@@ -44,6 +38,9 @@ type setupProvider struct {
 	NeedsAPIVersion bool `json:"needs_api_version,omitempty"`
 	// NeedsBaseURL forces the endpoint field (e.g. the Azure resource URL).
 	NeedsBaseURL bool `json:"needs_base_url,omitempty"`
+	// Custom marks a user-defined provider: the user names it and points
+	// Antares at any OpenAI-compatible endpoint, local or remote.
+	Custom bool `json:"custom,omitempty"`
 }
 
 func setupProviderCatalogue(cfg *config.Config) []setupProvider {
@@ -140,22 +137,12 @@ func setupProviderCatalogue(cfg *config.Config) []setupProvider {
 			BaseURL: "https://api.openai.com/v1",
 		},
 		{
-			ID: "custom", Label: "Something else", Kind: "openai-compatible",
-			Hint: "Any OpenAI-compatible endpoint.",
-		},
-		{
-			ID: "cursor", Label: "Cursor Cloud Agents", Kind: "cursor-agent",
-			Capability: "agent",
-			Hint:       "Delegate coding tasks to durable Cursor Cloud Agents.",
-			KeyHint:    "crsr_…", KeyURL: "https://cursor.com/dashboard/api",
-			BaseURL: "https://api.cursor.com",
-			Note:    "This deployment key and Cursor quota are shared by users allowed to invoke Cursor tools.",
+			ID: "custom", Label: "Custom provider", Kind: "openai-compatible",
+			Hint:         "Any OpenAI-compatible endpoint — name it yourself.",
+			NeedsBaseURL: true, Custom: true,
 		},
 	}
 	for i := range out {
-		if out[i].Capability == "" {
-			out[i].Capability = "llm"
-		}
 		// Resolve only configured providers. ResolveProvider intentionally
 		// treats an unknown name as the legacy inline model provider, which
 		// would otherwise make absent catalogue entries inherit ANTARES_API_KEY
@@ -171,6 +158,18 @@ func setupProviderCatalogue(cfg *config.Config) []setupProvider {
 	return out
 }
 
+// lookupSetupProvider finds a catalogue entry by id, or nil for ids that are
+// not built-ins (user-defined providers, typos).
+func lookupSetupProvider(cfg *config.Config, id string) *setupProvider {
+	catalogue := setupProviderCatalogue(cfg)
+	for i := range catalogue {
+		if catalogue[i].ID == id {
+			return &catalogue[i]
+		}
+	}
+	return nil
+}
+
 // NeedsSetup reports whether Antares can answer at all yet.
 func NeedsSetup(cfg *config.Config) bool {
 	if strings.TrimSpace(cfg.Model.Default) == "" {
@@ -183,17 +182,7 @@ func NeedsSetup(cfg *config.Config) bool {
 func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 	cfg := s.config()
 	home, _ := os.UserHomeDir()
-	// Onboarding only ever picks a chat-model provider: agent integrations
-	// (Cursor) are connected later, from Settings, and must never appear in
-	// the first-run picker.
-	catalogue := setupProviderCatalogue(cfg)
-	visible := make([]setupProvider, 0, len(catalogue))
-	for _, p := range catalogue {
-		if p.Capability == "agent" {
-			continue
-		}
-		visible = append(visible, p)
-	}
+	visible := setupProviderCatalogue(cfg)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"needs_setup": NeedsSetup(cfg),
 		"model":       cfg.Model.Default,
@@ -235,19 +224,15 @@ func (s *Server) handleSetupTest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("unknown provider"))
 		return
 	}
-	// Agent integrations (Cursor) are not chat-model providers: fail before
-	// the generic llm.New call below, and point at the dedicated flow rather
-	// than the setup wizard's "test connection" step.
-	if chosen.Capability == "agent" {
-		writeError(w, http.StatusBadRequest, fmt.Errorf(
-			"%s is an agent integration; connect it via POST /api/providers/%s/key and browse its models via GET /api/providers/%s/models",
-			chosen.ID, chosen.ID, chosen.ID))
+	baseURL := firstNonEmpty(body.BaseURL, chosen.BaseURL)
+	if chosen.Custom && baseURL == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "error": "A base URL is required for a custom provider.",
+		})
 		return
 	}
-
-	baseURL := firstNonEmpty(body.BaseURL, chosen.BaseURL)
 	if baseURL != "" {
-		if err := s.validateProviderBaseURL(r.Context(), baseURL, chosen.Local); err != nil {
+		if err := s.validateChosenBaseURL(r.Context(), baseURL, chosen.Custom, chosen.Local); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -259,7 +244,9 @@ func (s *Server) handleSetupTest(w http.ResponseWriter, r *http.Request) {
 			apiKey = p.APIKey
 		}
 	}
-	if apiKey == "" && !isLocalEndpoint(baseURL) {
+	// A keyless custom service on a LAN is legitimate; everything else needs
+	// a credential unless the endpoint is local.
+	if apiKey == "" && !chosen.Custom && !isLocalEndpoint(baseURL) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": false, "error": "An API key is required for this provider.",
 		})
@@ -311,8 +298,6 @@ func (s *Server) handleSetupTest(w http.ResponseWriter, r *http.Request) {
 
 // handleSetupComplete writes everything the wizard collected in one save.
 func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	s.setupMu.Lock()
 	defer s.setupMu.Unlock()
 	if s.requireSetupAccess(w, r) {
@@ -321,6 +306,7 @@ func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		Provider  string `json:"provider"`
+		Name      string `json:"name"`
 		BaseURL   string `json:"base_url"`
 		APIKey    string `json:"api_key"`
 		Model     string `json:"model"`
@@ -359,48 +345,46 @@ func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	catalogue := setupProviderCatalogue(cfg)
-	var chosen *setupProvider
-	for i := range catalogue {
-		if catalogue[i].ID == body.Provider {
-			chosen = &catalogue[i]
-			break
-		}
-	}
+	chosen := lookupSetupProvider(cfg, body.Provider)
 	if chosen == nil {
 		writeError(w, http.StatusBadRequest, errors.New("unknown provider"))
 		return
 	}
-	// Agent integrations (Cursor) are not chat-model providers: initial setup
-	// must pick an active model, which an agent capability cannot serve. This
-	// check runs before any config mutation below.
-	if chosen.Capability == "agent" {
-		writeError(w, http.StatusBadRequest,
-			errors.New("this provider is an agent integration and cannot be used for initial setup"))
+	// A custom provider is stored under an id minted from the user's name, so
+	// more than one can exist. An unnamed one defaults to "custom-provider"
+	// with the catalogue label — a visible, manageable provider either way.
+	providerID := body.Provider
+	if chosen.Custom {
+		providerID = CustomProviderID(cfg, body.Name)
+	}
+	baseURL := firstNonEmpty(body.BaseURL, chosen.BaseURL)
+	if chosen.Custom && baseURL == "" {
+		writeError(w, http.StatusBadRequest, errors.New("a base URL is required for a custom provider"))
 		return
 	}
-
-	baseURL := firstNonEmpty(body.BaseURL, chosen.BaseURL)
 	if baseURL != "" {
-		if err := s.validateProviderBaseURL(r.Context(), baseURL, chosen.Local); err != nil {
+		if err := s.validateChosenBaseURL(r.Context(), baseURL, chosen.Custom, chosen.Local); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 	}
 
-	entry := cfg.Providers[body.Provider]
+	entry := cfg.Providers[providerID]
 	entry.Kind = chosen.Kind
 	entry.Enabled = true
 	entry.Label = chosen.Label
+	if name := strings.TrimSpace(body.Name); chosen.Custom && name != "" {
+		entry.Label = name
+	}
 	if baseURL != "" {
 		entry.BaseURL = baseURL
 	}
 	if key := strings.TrimSpace(body.APIKey); key != "" && !strings.Contains(key, "••••") {
 		entry.APIKey = key
 	}
-	cfg.Providers[body.Provider] = entry
+	cfg.Providers[providerID] = entry
 
-	cfg.Model.Provider = body.Provider
+	cfg.Model.Provider = providerID
 	cfg.Model.Default = strings.TrimSpace(body.Model)
 
 	if ws := strings.TrimSpace(body.Workspace); ws != "" {
@@ -491,25 +475,6 @@ func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// verifyCursorProvider checks a Cursor credential the same way Settings
-// verifies any other provider: confirm identity, then fetch the model
-// catalogue. Both must succeed before the caller persists anything.
-func (s *Server) verifyCursorProvider(
-	ctx context.Context,
-	baseURL, apiKey string,
-) (*cursor.ModelCatalog, error) {
-	client, err := s.newCursorMetadataClient(cursor.Options{
-		BaseURL: baseURL, APIKey: apiKey,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if _, err := client.Me(ctx); err != nil {
-		return nil, err
-	}
-	return client.Models(ctx)
-}
-
 // handleSetProviderKey verifies a credential and stores it in one step, so a
 // provider can be connected from wherever the user noticed it was missing
 // rather than sending them to hunt through Settings.
@@ -517,8 +482,6 @@ func (s *Server) verifyCursorProvider(
 // It exists because config.SetPath cannot write into the providers map: map
 // values are not addressable through reflection.
 func (s *Server) handleSetProviderKey(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -540,75 +503,49 @@ func (s *Server) handleSetProviderKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var chosen *setupProvider
-	for _, p := range setupProviderCatalogue(cfg) {
-		if p.ID == id {
-			cp := p
-			chosen = &cp
-			break
+	chosen := lookupSetupProvider(cfg, id)
+	entry, exists := cfg.Providers[id]
+	if chosen == nil {
+		// Not in the catalogue: still manageable when it is a user-defined
+		// custom provider already present in the config.
+		if !exists {
+			writeError(w, http.StatusBadRequest, errors.New("unknown provider"))
+			return
 		}
 	}
-	if chosen == nil {
-		writeError(w, http.StatusBadRequest, errors.New("unknown provider"))
-		return
+	custom := chosen == nil || chosen.Custom
+	local := chosen != nil && chosen.Local
+	var catalogueBaseURL string
+	if chosen != nil {
+		catalogueBaseURL = chosen.BaseURL
 	}
-
-	entry := cfg.Providers[id]
 	if entry.Kind == "" {
-		entry.Kind = chosen.Kind
+		if chosen != nil {
+			entry.Kind = chosen.Kind
+		} else {
+			entry.Kind = "openai-compatible"
+		}
 	}
-	baseURL := firstNonEmpty(body.BaseURL, entry.BaseURL, chosen.BaseURL)
+	baseURL := firstNonEmpty(body.BaseURL, entry.BaseURL, catalogueBaseURL)
 	if baseURL != "" {
-		if err := s.validateProviderBaseURL(r.Context(), baseURL, chosen.Local); err != nil {
+		if err := s.validateChosenBaseURL(r.Context(), baseURL, custom, local); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 	}
 	region := firstNonEmpty(body.Region, entry.Region)
 	apiVersion := firstNonEmpty(body.APIVersion, entry.APIVersion)
+	// A blank or redacted key means "keep what is stored" (same convention as
+	// the setup wizard): reconnecting to update the endpoint must not silently
+	// wipe the saved credential. The connection test runs with the kept key.
 	key := strings.TrimSpace(body.APIKey)
-	// Bedrock takes its credentials from the AWS environment, so no key here.
-	if key == "" && entry.Kind != "bedrock" && !isLocalEndpoint(baseURL) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "An API key is required."})
-		return
+	if key == "" || strings.Contains(key, "••••") {
+		key = strings.TrimSpace(entry.APIKey)
 	}
-
-	// Cursor is an agent integration, not a chat-model provider: verify it
-	// through the metadata client rather than the generic llm.New path (which
-	// deliberately refuses "cursor-agent" — see llm.New), and never touch
-	// cfg.Model on success.
-	if chosen.Capability == "agent" {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-		catalog, err := s.verifyCursorProvider(ctx, baseURL, key)
-		if err != nil {
-			if cursor.IsAuthError(err) {
-				writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
-				return
-			}
-			writeJSON(w, http.StatusBadGateway, map[string]any{
-				"ok": false, "error": "The provider could not be reached or returned an invalid response: " + err.Error(),
-			})
-			return
-		}
-
-		entry.APIKey = key
-		entry.BaseURL = baseURL
-		entry.Enabled = true
-		if entry.Label == "" {
-			entry.Label = chosen.Label
-		}
-		cfg.Providers[id] = entry
-
-		if err := config.Save(cfg); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if err := s.applyReload(); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": len(catalog.Items)})
+	// Bedrock takes its credentials from the AWS environment, so no key here.
+	// Custom providers may be keyless services on a LAN, so no key is forced.
+	if key == "" && !custom && entry.Kind != "bedrock" && !isLocalEndpoint(baseURL) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "An API key is required."})
 		return
 	}
 
@@ -645,7 +582,11 @@ func (s *Server) handleSetProviderKey(w http.ResponseWriter, r *http.Request) {
 	entry.APIVersion = apiVersion
 	entry.Enabled = true
 	if entry.Label == "" {
-		entry.Label = chosen.Label
+		if chosen != nil {
+			entry.Label = chosen.Label
+		} else {
+			entry.Label = id
+		}
 	}
 	cfg.Providers[id] = entry
 
@@ -658,4 +599,48 @@ func (s *Server) handleSetProviderKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": len(models)})
+}
+
+// slugifyProviderName turns a display name into a config id: lowercase
+// alphanumerics with dashes for everything else.
+func slugifyProviderName(name string) string {
+	var b strings.Builder
+	prevDash := true // suppresses a leading dash
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevDash = false
+			continue
+		}
+		if !prevDash {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// isCatalogueProviderID reports whether id names a built-in provider.
+func isCatalogueProviderID(id string) bool {
+	return lookupSetupProvider(&config.Config{}, id) != nil
+}
+
+// CustomProviderID mints a unique config id for a user-named provider. A name
+// that slugs to nothing (or to "custom" itself) becomes "custom-provider"
+// — never the legacy "custom" slot, which no longer renders on the providers
+// page, so a nameless setup still lands on a visible, manageable provider.
+// The id avoids every built-in catalogue id and any provider already in the
+// config; it is the single minter shared by the web API and both wizards.
+func CustomProviderID(cfg *config.Config, name string) string {
+	slug := slugifyProviderName(name)
+	if slug == "" || slug == "custom" {
+		slug = "custom-provider"
+	}
+	base := slug
+	for i := 2; ; i++ {
+		if _, taken := cfg.Providers[slug]; !taken && !isCatalogueProviderID(slug) {
+			return slug
+		}
+		slug = fmt.Sprintf("%s-%d", base, i)
+	}
 }

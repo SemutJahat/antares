@@ -74,8 +74,6 @@ func redactProxyURL(e config.ProxyEntry) string {
 // is updated in place (a blank password keeps the stored one); otherwise a new
 // entry is appended with a fresh id.
 func (s *Server) handleAddProxy(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -157,8 +155,6 @@ func (s *Server) handleAddProxy(w http.ResponseWriter, r *http.Request) {
 // how many were added and which lines failed, so a bad line never silently
 // vanishes.
 func (s *Server) handleBatchAddProxy(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -218,8 +214,6 @@ func (s *Server) handleBatchAddProxy(w http.ResponseWriter, r *http.Request) {
 
 // handleDeleteProxy removes an entry from the store.
 func (s *Server) handleDeleteProxy(w http.ResponseWriter, r *http.Request) {
-	s.configWriteMu.Lock()
-	defer s.configWriteMu.Unlock()
 	id := r.PathValue("id")
 	cfg, err := config.Reload()
 	if err != nil {
