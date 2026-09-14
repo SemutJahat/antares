@@ -8,11 +8,11 @@ import {
   EyeSlash,
   Key,
   Plugs,
+  Plus,
   ShieldCheck,
   Trash,
 } from '@phosphor-icons/react'
 import { del, get, post } from '@/lib/api'
-import { agentModelsErrorText, isAgentProvider, providerModelsPath, type ProviderCapability } from '@/lib/providerCapabilities'
 import { useApi } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
@@ -41,7 +41,6 @@ interface ProviderInfo {
   local: boolean
   base_url: string
   active: boolean
-  capability: ProviderCapability
   hint?: string
   key_hint?: string
   key_url?: string
@@ -51,6 +50,7 @@ interface ProviderInfo {
   needs_api_version?: boolean
   needs_base_url?: boolean
   timeout_seconds?: number
+  custom?: boolean
 }
 
 interface OptionsResponse {
@@ -74,8 +74,11 @@ type Group = 'oauth' | 'apikey' | 'local'
 // How a provider authenticates decides its group. Only Copilot uses a device
 // (OAuth) flow today; local endpoints need no credential; everything else is an
 // API key (or cloud env credentials, which still live under "API key" here).
+// A custom provider is always "API key" — even a localhost endpoint is a
+// service the user configured, not a built-in local runtime.
 function groupOf(p: ProviderInfo): Group {
   if (p.kind === 'copilot') return 'oauth'
+  if (p.custom) return 'apikey'
   if (p.local) return 'local'
   return 'apikey'
 }
@@ -116,6 +119,7 @@ function ProvidersTab({ onOpenModels }: { onOpenModels: () => void }) {
   const { t } = useI18n()
   const { data, loading, reload } = useApi<OptionsResponse>('/model/options')
   const [target, setTarget] = useState<ProviderInfo | null>(null)
+  const [creating, setCreating] = useState(false)
 
   const grouped = useMemo(() => {
     const g: Record<Group, ProviderInfo[]> = { oauth: [], apikey: [], local: [] }
@@ -161,8 +165,7 @@ function ProvidersTab({ onOpenModels }: { onOpenModels: () => void }) {
                           <span className="min-w-0 flex-1 truncate text-sm font-medium">
                             {providerName(p.label)}
                           </span>
-                          {isAgentProvider(p) ? <Badge variant="outline">{t('providers.agentIntegration')}</Badge> : null}
-                          {p.active && !isAgentProvider(p) ? <Badge>{t('models.activeNow')}</Badge> : null}
+                          {p.active ? <Badge>{t('models.activeNow')}</Badge> : null}
                         </div>
                         <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
                           {p.base_url || p.kind}
@@ -186,6 +189,15 @@ function ProvidersTab({ onOpenModels }: { onOpenModels: () => void }) {
                       </div>
                     </Card>
                   ))}
+                  {g === 'apikey' ? (
+                    <button
+                      onClick={() => setCreating(true)}
+                      className="flex min-h-24 flex-col items-center justify-center gap-1.5 rounded-[var(--radius-lg)] border border-dashed border-border p-3.5 text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+                    >
+                      <Plus className="size-5" />
+                      <span className="text-xs">{t('providers.addCustom')}</span>
+                    </button>
+                  ) : null}
                 </div>
               </section>
             ),
@@ -200,7 +212,117 @@ function ProvidersTab({ onOpenModels }: { onOpenModels: () => void }) {
           onChanged={reload}
         />
       ) : null}
+
+      {creating ? (
+        <AddProviderDialog
+          onClose={() => setCreating(false)}
+          onChanged={reload}
+        />
+      ) : null}
     </PageLayout>
+  )
+}
+
+/**
+ * Create a custom provider: a name, an OpenAI-compatible base URL, and an
+ * optional key. Local endpoints are accepted; the backend verifies the pair
+ * before saving.
+ */
+function AddProviderDialog({
+  onClose,
+  onChanged,
+}: {
+  onClose: () => void
+  onChanged: () => void
+}) {
+  const { t } = useI18n()
+  const [name, setName] = useState('')
+  const [baseURL, setBaseURL] = useState('')
+  const [key, setKey] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+
+  const create = async () => {
+    if (!name.trim() || !baseURL.trim()) return
+    setBusy(true)
+    setError(undefined)
+    try {
+      const r = await post<{ ok: boolean; error?: string }>('/providers', {
+        name: name.trim(),
+        base_url: baseURL.trim(),
+        api_key: key.trim(),
+      })
+      if (!r.ok) {
+        setError(r.error ?? t('models.connectFailed'))
+        return
+      }
+      onChanged()
+      onClose()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(o) => (!o ? onClose() : null)}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{t('providers.newTitle')}</DialogTitle>
+          <DialogDescription>{t('providers.newDesc')}</DialogDescription>
+        </DialogHeader>
+        <DialogBody className="space-y-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="np-name">{t('providers.name')}</Label>
+            <Input
+              id="np-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={t('providers.namePlaceholder')}
+              autoFocus
+              autoComplete="off"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="np-url">{t('setup.baseUrl')}</Label>
+            <Input
+              id="np-url"
+              value={baseURL}
+              onChange={(e) => setBaseURL(e.target.value)}
+              placeholder="https://api.example.com/v1"
+              className="font-mono text-xs"
+              autoComplete="off"
+              onKeyDown={(e) => e.key === 'Enter' && create()}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="np-key">{t('setup.apiKey')}</Label>
+            <Input
+              id="np-key"
+              type="password"
+              value={key}
+              onChange={(e) => setKey(e.target.value)}
+              placeholder="sk-…"
+              autoComplete="off"
+              onKeyDown={(e) => e.key === 'Enter' && create()}
+            />
+            <p className="text-[11px] text-muted-foreground">{t('providers.keyOptional')}</p>
+          </div>
+          {error ? (
+            <p className="rounded-[var(--radius-sm)] border border-destructive/40 bg-destructive/10 p-2.5 text-xs text-destructive">{error}</p>
+          ) : null}
+        </DialogBody>
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button variant="outline" size="sm">{t('update.cancel')}</Button>
+          </DialogClose>
+          <Button size="sm" onClick={create} loading={busy} disabled={!name.trim() || !baseURL.trim()}>
+            {t('providers.add')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -246,19 +368,6 @@ interface AllModel {
   context_window: number
 }
 
-interface AgentModel {
-  id: string
-  name: string
-  description?: string
-  parameters?: unknown[]
-}
-
-interface AgentModelsResponse {
-  models: AgentModel[]
-  needs_key?: boolean
-  error?: string
-}
-
 /**
  * Manage one provider in a modal: credentials, its models (add/remove with an
  * auto-fetched context window), and advanced settings. Each section saves to
@@ -289,21 +398,22 @@ function ProviderModal({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
 
-  // Both hooks must run for every provider; the irrelevant endpoint is disabled.
-  const agentOnly = isAgentProvider(p)
-  const agentModelsState = useApi<AgentModelsResponse>(providerModelsPath(p))
-  const llmModelsState = useApi<{ models: AllModel[] }>(agentOnly ? null : '/model/list-all')
+  const llmModelsState = useApi<{ models: AllModel[] }>('/model/list-all')
   const myModels = (llmModelsState.data?.models ?? []).filter((m) => m.provider === p.id)
-  const agentModelsError = agentModelsErrorText(agentModelsState.data, agentModelsState.error)
   const [newModel, setNewModel] = useState('')
   const [newCtx, setNewCtx] = useState('')
   const [ctxAuto, setCtxAuto] = useState(false)
   const [modelBusy, setModelBusy] = useState(false)
 
   // Advanced
+  const [label, setLabel] = useState(p.label)
   const [timeout, setTimeoutSecs] = useState(String(p.timeout_seconds ?? ''))
 
-  const keyRequired = p.kind !== 'bedrock' && !p.local
+  // A local runtime needs no key; bedrock takes AWS env credentials. A custom
+  // provider usually wants one but a keyless service is fine, so the field is
+  // shown yet optional there.
+  const keyRequired = p.kind !== 'bedrock' && !p.local && !p.custom
+  const showKey = p.kind !== 'bedrock' && !p.local
   const canConnect =
     (!keyRequired || key.trim() !== '') &&
     (!p.needs_base_url || baseURL.trim() !== '') &&
@@ -382,8 +492,22 @@ function ProviderModal({
       await post(`/providers/${encodeURIComponent(p.id)}/settings`, {
         base_url: baseURL.trim(),
         timeout_seconds: timeout ? Number(timeout) : 0,
+        ...(p.custom ? { label: label.trim() } : {}),
       })
       onChanged()
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const removeProvider = async () => {
+    setBusy(true)
+    try {
+      await del(`/providers/${encodeURIComponent(p.id)}`)
+      onChanged()
+      onClose()
+    } catch (e) {
+      setError((e as Error).message)
     } finally {
       setBusy(false)
     }
@@ -406,7 +530,7 @@ function ProviderModal({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>{providerName(p.label)}</DialogTitle>
-          <DialogDescription>{agentOnly ? t('providers.agentManageDesc') : t('providers.manageDesc')}</DialogDescription>
+          <DialogDescription>{t('providers.manageDesc')}</DialogDescription>
         </DialogHeader>
 
         <div className="flex gap-1 border-b border-border pb-2">
@@ -424,7 +548,7 @@ function ProviderModal({
                   <Input id="m-baseurl" value={baseURL} onChange={(e) => setBaseURL(e.target.value)} autoComplete="off" />
                 </div>
               ) : null}
-              {keyRequired ? (
+              {showKey ? (
                 <div className="space-y-1.5">
                   <Label htmlFor="m-key">{p.key_label ?? t('setup.apiKey')}</Label>
                   <div className="flex gap-2">
@@ -442,6 +566,11 @@ function ProviderModal({
                       {reveal ? <EyeSlash className="size-4" /> : <Eye className="size-4" />}
                     </Button>
                   </div>
+                  {p.has_key && !key ? (
+                    <p className="text-[11px] text-muted-foreground">{t('setup.keyKept')}</p>
+                  ) : p.custom ? (
+                    <p className="text-[11px] text-muted-foreground">{t('providers.keyOptional')}</p>
+                  ) : null}
                 </div>
               ) : null}
               {p.needs_region ? (
@@ -471,94 +600,73 @@ function ProviderModal({
 
           {section === 'models' ? (
             <>
-              {agentOnly ? (
-                <>
-                  <p className="text-xs text-muted-foreground">{t('providers.agentModelsReadOnly')}</p>
-                  {agentModelsState.data?.needs_key ? (
-                    <p className="py-4 text-center text-xs text-muted-foreground">{t('models.needsKey')}</p>
-                  ) : agentModelsError ? (
-                    <p className="rounded-[var(--radius-sm)] border border-destructive/40 bg-destructive/10 p-2.5 text-xs text-destructive">
-                      {agentModelsError}
-                    </p>
-                  ) : (agentModelsState.data?.models ?? []).length === 0 ? (
-                    <p className="py-4 text-center text-xs text-muted-foreground">{t('models.none')}</p>
-                  ) : (
-                    <div className="max-h-64 space-y-1.5 overflow-y-auto">
-                      {(agentModelsState.data?.models ?? []).map((m) => (
-                        <div key={m.id} className="rounded-[var(--radius-sm)] border border-border p-2.5">
-                          <p className="truncate font-mono text-xs">{m.id}</p>
-                          <p className="truncate text-xs text-muted-foreground">{m.name}</p>
-                          {m.description ? <p className="mt-1 text-[11px] text-muted-foreground">{m.description}</p> : null}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </>
+              <div className="space-y-1.5 rounded-[var(--radius-sm)] border border-border p-3">
+                <Label>{t('providers.addModel')}</Label>
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <Input
+                    value={newModel}
+                    onChange={(e) => {
+                      setNewModel(e.target.value)
+                      setCtxAuto(false)
+                    }}
+                    onBlur={() => autoFetchCtx(newModel)}
+                    placeholder={t('providers.modelIdPlaceholder')}
+                    className="sm:flex-1"
+                  />
+                  <Input
+                    value={newCtx}
+                    onChange={(e) => setNewCtx(e.target.value)}
+                    placeholder={t('providers.ctxPlaceholder')}
+                    inputMode="numeric"
+                    className="sm:w-40"
+                  />
+                  <Button size="sm" onClick={addModel} loading={modelBusy} disabled={!newModel.trim()}>
+                    {t('providers.add')}
+                  </Button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  {ctxAuto ? t('providers.ctxAuto') : t('providers.ctxHint')}
+                </p>
+              </div>
+
+              {myModels.length === 0 ? (
+                <p className="py-4 text-center text-xs text-muted-foreground">{t('models.none')}</p>
               ) : (
-                <>
-                  <div className="space-y-1.5 rounded-[var(--radius-sm)] border border-border p-3">
-                    <Label>{t('providers.addModel')}</Label>
-                    <div className="flex flex-col gap-2 sm:flex-row">
-                      <Input
-                        value={newModel}
-                        onChange={(e) => {
-                          setNewModel(e.target.value)
-                          setCtxAuto(false)
-                        }}
-                        onBlur={() => autoFetchCtx(newModel)}
-                        placeholder={t('providers.modelIdPlaceholder')}
-                        className="sm:flex-1"
-                      />
-                      <Input
-                        value={newCtx}
-                        onChange={(e) => setNewCtx(e.target.value)}
-                        placeholder={t('providers.ctxPlaceholder')}
-                        inputMode="numeric"
-                        className="sm:w-40"
-                      />
-                      <Button size="sm" onClick={addModel} loading={modelBusy} disabled={!newModel.trim()}>
-                        {t('providers.add')}
+                <div className="max-h-64 space-y-1.5 overflow-y-auto">
+                  {myModels.map((m) => (
+                    <div key={m.id} className="flex items-center gap-2 rounded-[var(--radius-sm)] border border-border p-2.5">
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-mono text-xs">{m.id}</p>
+                        {m.context_window > 0 ? (
+                          <p className="text-[10px] text-muted-foreground">
+                            {t('models.ctx', { n: Math.round(m.context_window / 1000) })}
+                          </p>
+                        ) : null}
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t('common.delete')}
+                        onClick={() => removeModel(m.id)}
+                        className="shrink-0 text-muted-foreground hover:text-destructive"
+                      >
+                        <Trash className="size-4" />
                       </Button>
                     </div>
-                    <p className="text-[11px] text-muted-foreground">
-                      {ctxAuto ? t('providers.ctxAuto') : t('providers.ctxHint')}
-                    </p>
-                  </div>
-
-                  {myModels.length === 0 ? (
-                    <p className="py-4 text-center text-xs text-muted-foreground">{t('models.none')}</p>
-                  ) : (
-                    <div className="max-h-64 space-y-1.5 overflow-y-auto">
-                      {myModels.map((m) => (
-                        <div key={m.id} className="flex items-center gap-2 rounded-[var(--radius-sm)] border border-border p-2.5">
-                          <div className="min-w-0 flex-1">
-                            <p className="truncate font-mono text-xs">{m.id}</p>
-                            {m.context_window > 0 ? (
-                              <p className="text-[10px] text-muted-foreground">
-                                {t('models.ctx', { n: Math.round(m.context_window / 1000) })}
-                              </p>
-                            ) : null}
-                          </div>
-                          <Button
-                            variant="ghost"
-                            size="icon-sm"
-                            aria-label={t('common.delete')}
-                            onClick={() => removeModel(m.id)}
-                            className="shrink-0 text-muted-foreground hover:text-destructive"
-                          >
-                            <Trash className="size-4" />
-                          </Button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </>
+                  ))}
+                </div>
               )}
             </>
           ) : null}
 
           {section === 'advanced' ? (
             <>
+              {p.custom ? (
+                <div className="space-y-1.5">
+                  <Label htmlFor="m-name">{t('providers.name')}</Label>
+                  <Input id="m-name" value={label} onChange={(e) => setLabel(e.target.value)} autoComplete="off" />
+                </div>
+              ) : null}
               <div className="space-y-1.5">
                 <Label htmlFor="m-baseurl2">{t('models.baseUrl')}</Label>
                 <Input id="m-baseurl2" value={baseURL} onChange={(e) => setBaseURL(e.target.value)} placeholder={p.kind} autoComplete="off" />
@@ -573,6 +681,18 @@ function ProviderModal({
         </DialogBody>
 
         <DialogFooter>
+          {p.custom ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={removeProvider}
+              loading={busy}
+              className="mr-auto gap-1.5 text-muted-foreground hover:text-destructive"
+            >
+              <Trash className="size-3.5" />
+              {t('providers.deleteProvider')}
+            </Button>
+          ) : null}
           <DialogClose asChild>
             <Button variant="outline" size="sm">{t('common.close')}</Button>
           </DialogClose>
