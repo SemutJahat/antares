@@ -17,7 +17,8 @@ import (
 	"github.com/enowdev/antares/internal/secret"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // postgres driver
-	_ "modernc.org/sqlite"             // pure-Go sqlite driver
+	sqlite3 "modernc.org/sqlite"       // pure-Go sqlite driver
+	sqlite3lib "modernc.org/sqlite/lib"
 )
 
 // ErrNotFound is returned when a lookup by id yields nothing.
@@ -40,19 +41,28 @@ type sqlStore struct {
 	socialBoxOnce sync.Once
 	socialKeyBox  *secret.Box
 	socialKeyErr  error
+
+	// ragMu guards the per-collection HNSW cache. All graph mutations and cache
+	// map reads/writes happen under this mutex; searches take it just long
+	// enough to fetch the cached entry, then release before calling into hnsw
+	// with the entry's own inner lock so parallel searches can proceed.
+	ragMu    sync.Mutex
+	ragCache map[string]*vectorIndexEntry
 }
 
 // Open connects to the configured backend and applies migrations.
 // driver is one of sqlite, postgres, memory.
 func Open(ctx context.Context, driver, dsn string, maxConns, busyMS int, wal bool) (Store, error) {
 	var (
-		db  *sql.DB
-		err error
-		dia string
+		db         *sql.DB
+		err        error
+		dia        string
+		fileBacked bool
 	)
 	switch strings.ToLower(strings.TrimSpace(driver)) {
 	case "", "sqlite", "sqlite3":
 		dia = "sqlite"
+		fileBacked = true
 		if dsn == "" {
 			return nil, errors.New("sqlite dsn (file path) is required")
 		}
@@ -60,8 +70,15 @@ func Open(ctx context.Context, driver, dsn string, maxConns, busyMS int, wal boo
 			return nil, err
 		}
 		params := []string{"_pragma=foreign_keys(1)", "_pragma=busy_timeout(" + strconv.Itoa(max(busyMS, 5000)) + ")"}
+		// journal_mode is a DB-level, persistent setting: it's fine to set
+		// it once. Running PRAGMA journal_mode=WAL on EVERY new
+		// connection (as an _pragma URL param does) sends racing
+		// journal-transition writes at connection-pool churn time; the
+		// sqlite driver returns SQLITE_BUSY for those and busy_timeout
+		// does NOT retry them. synchronous is per-connection and stays
+		// on the DSN.
 		if wal {
-			params = append(params, "_pragma=journal_mode(WAL)", "_pragma=synchronous(NORMAL)")
+			params = append(params, "_pragma=synchronous(NORMAL)")
 		}
 		db, err = sql.Open("sqlite", "file:"+dsn+"?"+strings.Join(params, "&"))
 	case "memory", "inmemory", "in-memory":
@@ -93,6 +110,12 @@ func Open(ctx context.Context, driver, dsn string, maxConns, busyMS int, wal boo
 		db.Close()
 		return nil, fmt.Errorf("connect %s: %w", dia, err)
 	}
+	if fileBacked && wal {
+		if err := initSQLiteWAL(ctx, db, max(busyMS, 5000)); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	if err := s.migrate(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -100,44 +123,61 @@ func Open(ctx context.Context, driver, dsn string, maxConns, busyMS int, wal boo
 	return s, nil
 }
 
-func (s *sqlStore) migrate(ctx context.Context) error {
-	stmts := append([]string{}, migrations...)
-	if s.dialect == "sqlite" {
-		stmts = append(stmts, sqliteFTS...)
-	} else {
-		stmts = append(stmts, postgresFTS...)
+// initSQLiteWAL sets the database into WAL journal mode exactly once, from
+// one dedicated connection. journal_mode is a persistent, DB-level setting,
+// so this doesn't need to run on every pooled connection — and MUST NOT,
+// because concurrent journal transitions from a racing opener return
+// SQLITE_BUSY without ever consulting busy_timeout.
+//
+// If the file lock is contended (another Antares process is opening the same
+// DB), retry with exponential backoff up to busyMS milliseconds, matching
+// the caller's configured busy budget. Any other error, or a mode read-back
+// that isn't "wal", fails Open loudly rather than silently downgrading to
+// rollback journalling.
+func initSQLiteWAL(ctx context.Context, db *sql.DB, busyMS int) error {
+	deadline := time.Now().Add(time.Duration(busyMS) * time.Millisecond)
+	backoff := 10 * time.Millisecond
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("sqlite wal: acquire conn: %w", err)
 	}
-	for _, q := range stmts {
-		if _, err := s.db.ExecContext(ctx, q); err != nil {
-			// Additive `ALTER TABLE ... ADD COLUMN` migrations are idempotent by
-			// intent: on a DB that already has the column (fresh CREATE, or a
-			// prior run) the engine reports "duplicate column", which is success
-			// for our purposes. Everything else is fatal.
-			if isAddColumn(q) && isDuplicateColumn(err) {
-				continue
+	defer conn.Close()
+
+	for {
+		var mode string
+		err := conn.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&mode)
+		if err == nil {
+			if !strings.EqualFold(mode, "wal") {
+				return fmt.Errorf("sqlite wal: PRAGMA returned journal_mode=%q, want wal", mode)
 			}
-			return fmt.Errorf("migrate: %w\n%s", err, firstLine(q))
+			return nil
+		}
+		if !isSQLiteBusy(err) {
+			return fmt.Errorf("sqlite wal: PRAGMA journal_mode=WAL: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("sqlite wal: PRAGMA journal_mode=WAL busy after %dms: %w", busyMS, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 200*time.Millisecond {
+			backoff *= 2
 		}
 	}
-	return nil
 }
 
-func isAddColumn(q string) bool {
-	u := strings.ToUpper(q)
-	return strings.Contains(u, "ALTER TABLE") && strings.Contains(u, "ADD COLUMN")
-}
-
-func isDuplicateColumn(err error) bool {
-	m := strings.ToLower(err.Error())
-	// sqlite: "duplicate column name"; postgres: "column ... already exists".
-	return strings.Contains(m, "duplicate column") || strings.Contains(m, "already exists")
-}
-
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i > 0 {
-		return s[:i]
+// isSQLiteBusy reports whether err (or any error it wraps) is a
+// modernc.org/sqlite driver error with primary code SQLITE_BUSY. The driver
+// packs an extended error code into the low bits, so we mask before compare.
+func isSQLiteBusy(err error) bool {
+	var se *sqlite3.Error
+	if !errors.As(err, &se) {
+		return false
 	}
-	return s
+	return se.Code()&0xff == sqlite3lib.SQLITE_BUSY
 }
 
 func (s *sqlStore) Driver() string { return s.dialect }

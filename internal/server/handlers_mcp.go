@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -14,6 +13,8 @@ import (
 // This is the manual counterpart to /api/hub/mcp/install: for a server that is
 // not in the catalogue — an internal endpoint, a command of your own.
 func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -89,16 +90,16 @@ func (s *Server) handleAddMCPServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if s.mcp != nil {
-		// Connecting can take seconds while npx downloads a package; do it off
-		// the request so the form returns promptly.
-		go s.mcp.Connect(context.Background(), s.config())
-	}
+	// MCP is reconciled — applyReload (rt.reload) already ran MCP.Refresh
+	// with the desired config. A second Connect here would build duplicate
+	// transports and leak the old ones.
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": name})
 }
 
 // handleDeleteMCPServer removes a server from the config and disconnects it.
 func (s *Server) handleDeleteMCPServer(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -121,9 +122,9 @@ func (s *Server) handleDeleteMCPServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if s.mcp != nil {
-		go s.mcp.Connect(context.Background(), s.config())
-	}
+	// MCP is reconciled — applyReload (rt.reload) already refreshed the
+	// active servers from the desired config, so the removed server is
+	// disconnected without a second Connect that would rebuild everything.
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

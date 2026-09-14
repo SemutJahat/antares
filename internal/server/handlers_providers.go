@@ -181,6 +181,8 @@ func (s *Server) handleContextWindow(w http.ResponseWriter, r *http.Request) {
 // optional context window stored in model_meta. Manually added models then
 // appear in the model list alongside auto-discovered ones (see agent.Models).
 func (s *Server) handleAddProviderModel(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -249,6 +251,8 @@ func (s *Server) handleAddProviderModel(w http.ResponseWriter, r *http.Request) 
 
 // handleDeleteProviderModel removes a manually added model id (and its meta).
 func (s *Server) handleDeleteProviderModel(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -293,6 +297,8 @@ func (s *Server) handleDeleteProviderModel(w http.ResponseWriter, r *http.Reques
 // timeout, and custom headers. Credentials go through the key endpoint; this is
 // everything else a provider entry carries.
 func (s *Server) handleProviderSettings(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}

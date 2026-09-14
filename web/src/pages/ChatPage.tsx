@@ -1,40 +1,33 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import {
   ArrowUp,
-  Brain,
-  CaretDown,
-  Check,
-  Copy,
   FileText,
   Paperclip,
-  PencilSimple,
   Plus,
   SidebarSimple,
   Stop,
-  Terminal,
-  Warning,
   X,
 } from '@phosphor-icons/react'
-import { ApiError, get, post, streamGet, streamPost, type StreamEvent } from '@/lib/api'
+import { ApiError, get, post } from '@/lib/api'
 import {
-  groupStreamPatches,
-  queueStreamDelta,
-  shouldRefreshAfterAttach,
-  type QueuedStreamPatch,
-} from '@/lib/chatStreamQueue'
+  DEFAULT_MAX_LIVE_REASONING_CHARS,
+  hydrate,
+  normalizeErrorPayload,
+  type ChatMessage,
+  type SessionDetail,
+} from '@/lib/chatTranscript'
+import { useChatStream } from '@/lib/useChatStream'
+import type { LiveStatus, ForegroundRun } from '@/lib/chatStreamController'
 import { copyText } from '@/lib/clipboard'
-import { useI18n, useTimeAgo, type MessageKey } from '@/lib/i18n'
-import { cn } from '@/lib/utils'
+import { useI18n, type MessageKey } from '@/lib/i18n'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/primitives'
 import { SkeletonMessage } from '@/components/ui/skeleton'
-import { Markdown } from '@/components/chat/Markdown'
-import { ToolCallCard } from '@/components/chat/ToolCallCard'
+import { ErrorBanner, MessageBubble } from '@/components/chat/ChatTranscript'
 import { TaskBar, parseTasks } from '@/components/chat/TaskBar'
 import { ApprovalCard, type ApprovalView } from '@/components/chat/ApprovalCard'
-import { AskUserCard } from '@/components/chat/AskUserCard'
 import { RolePicker } from '@/components/chat/RolePicker'
 import { ModelPicker } from '@/components/chat/ModelPicker'
 import { ReasoningPicker } from '@/components/chat/ReasoningPicker'
@@ -49,200 +42,6 @@ import {
   useMatches,
   type CommandSpec,
 } from '@/components/chat/SlashPalette'
-
-export interface ToolCallView {
-  id: string
-  name: string
-  args: string
-  result?: string
-  isError?: boolean
-  progress?: string
-  running?: boolean
-}
-
-/** One part of an assistant turn, in the order it happened. */
-export type Segment =
-  | { kind: 'text'; text: string }
-  | { kind: 'reasoning'; text: string }
-  | { kind: 'tool'; call: ToolCallView }
-
-export interface ChatMessage {
-  id: string
-  role: 'user' | 'assistant' | 'tool' | 'system'
-  content: string
-  reasoning?: string
-  toolCalls?: ToolCallView[]
-  // segments is the timeline: text, reasoning, and tool calls interleaved as
-  // they arrived, so the transcript reads in the order the model worked.
-  segments?: Segment[]
-  createdAt?: string
-  tokensIn?: number
-  tokensOut?: number
-  error?: string
-  images?: string[]
-  // Non-image attachments shown as chips under the user's message.
-  docs?: { path: string; name: string }[]
-}
-
-/**
- * Default soft cap for live reasoning text in React state while a turn streams.
- * Overridden by `display.max_live_reasoning_chars` from config (0 = unlimited).
- * High-effort models can emit hundreds of KB of reasoning per turn; unbounded
- * string growth freezes the dashboard main thread. Full text is still saved
- * server-side and restored on attach `done` / hydrate.
- */
-export const DEFAULT_MAX_LIVE_REASONING_CHARS = 48_000
-
-/** Append a text or reasoning delta, extending the last segment when it is the
- *  same kind so a streamed sentence stays one block.
- *  `maxLiveReasoningChars`: trailing-window cap; ≤0 means unlimited. */
-export function appendSeg(
-  m: ChatMessage,
-  kind: 'text' | 'reasoning',
-  delta: string,
-  maxLiveReasoningChars: number = DEFAULT_MAX_LIVE_REASONING_CHARS,
-): ChatMessage {
-  const segs = m.segments ? m.segments.slice() : []
-  const last = segs[segs.length - 1]
-  if (last && last.kind === kind) {
-    segs[segs.length - 1] = { kind, text: last.text + delta }
-  } else {
-    segs.push({ kind, text: delta })
-  }
-  let content = m.content
-  let reasoning = m.reasoning
-  if (kind === 'text') {
-    content = m.content + delta
-  } else {
-    const next = (m.reasoning ?? '') + delta
-    const cap = maxLiveReasoningChars
-    // Keep a trailing window so the bubble stays usable and string growth is O(cap).
-    reasoning = cap > 0 && next.length > cap ? next.slice(next.length - cap) : next
-    const segLast = segs[segs.length - 1]
-    if (cap > 0 && segLast?.kind === 'reasoning' && segLast.text.length > cap) {
-      segs[segs.length - 1] = {
-        kind: 'reasoning',
-        text: segLast.text.slice(segLast.text.length - cap),
-      }
-    }
-  }
-  return {
-    ...m,
-    segments: segs,
-    content,
-    reasoning,
-  }
-}
-
-export function pushToolSeg(m: ChatMessage, call: ToolCallView): ChatMessage {
-  return {
-    ...m,
-    segments: [...(m.segments ?? []), { kind: 'tool', call }],
-    toolCalls: [...(m.toolCalls ?? []), call],
-  }
-}
-
-export function updateToolSeg(m: ChatMessage, id: string, fn: (c: ToolCallView) => ToolCallView): ChatMessage {
-  return {
-    ...m,
-    segments: (m.segments ?? []).map((seg) =>
-      seg.kind === 'tool' && seg.call.id === id ? { kind: 'tool', call: fn(seg.call) } : seg,
-    ),
-    toolCalls: (m.toolCalls ?? []).map((c) => (c.id === id ? fn(c) : c)),
-  }
-}
-
-interface SessionDetail {
-  session: {
-    id: string
-    title: string
-    model: string
-    provider: string
-    meta?: { project_dir?: string } | null
-  }
-  messages: Array<{
-    id: string
-    role: ChatMessage['role']
-    content: string
-    reasoning?: string
-    tool_calls?: string
-    tool_call_id?: string
-    tool_name?: string
-    attachments?: string
-    created_at: string
-    tokens_in: number
-    tokens_out: number
-    hidden?: boolean
-  }>
-}
-
-/** Rebuild view models from the persisted message log. */
-function hydrate(detail: SessionDetail): ChatMessage[] {
-  const out: ChatMessage[] = []
-  const pending = new Map<string, ToolCallView>()
-
-  for (const m of detail.messages) {
-    // Hidden messages (e.g. an injected sub-agent result) are context for the
-    // model, not something to render — the agent's continuation shows instead.
-    if (m.hidden) continue
-    if (m.role === 'tool') {
-      const call = pending.get(m.tool_call_id ?? '')
-      if (call) {
-        call.result = m.content
-        call.running = false
-      }
-      continue
-    }
-    const msg: ChatMessage = {
-      id: m.id,
-      role: m.role,
-      content: m.content,
-      reasoning: m.reasoning || undefined,
-      createdAt: m.created_at,
-      tokensIn: m.tokens_in,
-      tokensOut: m.tokens_out,
-    }
-    // Images sent with the message are stored as the same parts the model saw.
-    if (m.attachments) {
-      try {
-        const parts = JSON.parse(m.attachments) as Array<{
-          mime_type?: string
-          data?: string
-          url?: string
-        }>
-        const srcs = parts
-          .map((p) => p.url || (p.data ? `data:${p.mime_type || 'image/png'};base64,${p.data}` : ''))
-          .filter(Boolean)
-        if (srcs.length > 0) msg.images = srcs
-      } catch {
-        /* ignore malformed history */
-      }
-    }
-    const segments: Segment[] = []
-    if (msg.reasoning) segments.push({ kind: 'reasoning', text: msg.reasoning })
-    if (msg.content) segments.push({ kind: 'text', text: msg.content })
-    if (m.tool_calls) {
-      try {
-        const parsed = JSON.parse(m.tool_calls) as Array<{
-          id: string
-          name: string
-          arguments: string
-        }>
-        msg.toolCalls = parsed.map((c) => {
-          const view: ToolCallView = { id: c.id, name: c.name, args: c.arguments }
-          pending.set(c.id, view)
-          segments.push({ kind: 'tool', call: view })
-          return view
-        })
-      } catch {
-        /* ignore malformed history */
-      }
-    }
-    if (msg.role === 'assistant' && segments.length > 0) msg.segments = segments
-    out.push(msg)
-  }
-  return out
-}
 
 const SUGGESTION_KEYS: MessageKey[] = [
   'chat.suggest1',
@@ -317,6 +116,21 @@ function caretOnLastLine(el: HTMLTextAreaElement): boolean {
   return !el.value.slice(pos).includes('\n')
 }
 
+/** Prefer the raw API error body when it carries a server-supplied string —
+ *  `{ error }` or a plain string — so a 500's real message survives instead of
+ *  the generic "HTTP 500". Everything else falls back to err.message. */
+function pickErrorText(err: Error): string {
+  if (err instanceof ApiError) {
+    const body = err.body
+    if (typeof body === 'string' && body.trim() !== '') return body
+    if (body && typeof body === 'object' && 'error' in body) {
+      const field = body.error
+      if (typeof field === 'string' && field.trim() !== '') return field
+    }
+  }
+  return err.message
+}
+
 export default function ChatPage() {
   const { sessionId } = useParams<{ sessionId: string }>()
   const navigate = useNavigate()
@@ -328,13 +142,7 @@ export default function ChatPage() {
   const [streaming, setStreaming] = useState(false)
   // Live status for the streaming indicator: which step, and what tool (if any)
   // is running right now. Reset at the start of every send.
-  const [live, setLive] = useState<{
-    turn: number
-    tool?: string
-    waiting?: boolean
-    /** Server notice (compacting, steering, …) shown while streaming. */
-    notice?: string
-  }>({ turn: 1 })
+  const [live, setLive] = useState<LiveStatus>({ turn: 1 })
   const [input, setInput] = useState('')
   // Recent composer prompts (shell-style ↑/↓). Persisted across reloads.
   const [inputHistory, setInputHistory] = useState<string[]>(() => loadInputHistory())
@@ -505,7 +313,14 @@ export default function ChatPage() {
   }, [messages])
 
   const abortRef = useRef<(() => void) | null>(null)
-  // The bound project dir tracked in a ref, so a turn fired immediately after
+  // Foreground /chat run handle. Held so a session switch (or an explicit
+  // stop) can dispose it and silence every late frame the aborted socket
+  // still delivers — a text/reasoning/done event from session A must NEVER
+  // apply to session B's transcript.
+  const foregroundRunRef = useRef<ForegroundRun | null>(null)
+  // The session id the foreground run belongs to. `undefined` for a run
+  // started before the server assigned an id (brand-new chat).
+  const foregroundOwnerRef = useRef<string | undefined>(undefined)
   // binding (the auto-analyze on "Yes") posts with the project even before the
   // projectDir state re-render lands.
   const projectDirRef = useRef('')
@@ -526,6 +341,33 @@ export default function ChatPage() {
   const sessionIdRef = useRef<string | undefined>(sessionId)
   useEffect(() => {
     sessionIdRef.current = sessionId
+    // A route change (or the URL re-syncing to a stale/deleted id) belongs to
+    // a different session than the run currently in flight. Dispose it so a
+    // late text/reasoning/done/hydrate callback from the old socket can never
+    // mutate the new transcript.
+    //
+    // Ownership rule: a run is safe iff its owner id equals the route id, OR
+    // the URL just adopted a brand-new-chat id that this run itself produced
+    // (localSessionRef, set inside the run's onSession callback). An owner of
+    // `undefined` means "no session assigned yet" — that run is a pending
+    // handshake for whatever route was mounted when it started, so if the
+    // route changes mid-handshake the user has moved on and the run MUST die.
+    const run = foregroundRunRef.current
+    if (!run) return
+    const owner = foregroundOwnerRef.current
+    const routeMatches = owner === sessionId
+    const justAdopted = sessionId != null && sessionId === localSessionRef.current
+    if (routeMatches || justAdopted) return
+    run.dispose()
+    foregroundRunRef.current = null
+    foregroundOwnerRef.current = undefined
+    // dispose() deliberately skips onSettled, so the adoption ref has to be
+    // cleared here too: left set, the hydrate effect below would keep
+    // short-circuiting and show another session's transcript under this URL.
+    localSessionRef.current = null
+    abortRef.current = null
+    foregroundActiveRef.current = false
+    setStreaming(false)
   }, [sessionId])
   const virtuosoRef = useRef<VirtuosoHandle>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -534,73 +376,36 @@ export default function ChatPage() {
   // re-anchors the list mid-stream and fights followOutput.
   const initialIndexRef = useRef(0)
 
-  // A streaming turn emits hundreds of tiny events. Queue them for one render,
-  // grouping by message first so flushing is O(messages + patches), not
-  // O(messages * patches). Consecutive text/reasoning deltas are coalesced too:
-  // replaying a long live-run must not create thousands of closures and perform
-  // thousands of ever-growing string concatenations on the browser main thread.
-  const patchQueue = useRef<QueuedStreamPatch<ChatMessage>[]>([])
-  const flushHandle = useRef<number | null>(null)
-  const flushPatches = useCallback(() => {
-    flushHandle.current = null
-    const queued = patchQueue.current
-    if (queued.length === 0) return
-    patchQueue.current = []
-    const byMessage = groupStreamPatches(queued)
-    // Only clone/replace messages that actually received patches. Mapping the
-    // entire transcript every frame re-renders hundreds of bubbles on long
-    // sessions and was a major source of dashboard freezes during long turns.
-    setMessages((prev) => {
-      if (byMessage.size === 0) return prev
-      let next = prev
-      let cloned = false
-      for (const [id, patches] of byMessage) {
-        const idx = next.findIndex((m) => m.id === id)
-        if (idx < 0) continue
-        let message = next[idx]
-        for (const patch of patches) {
-          message =
-            patch.kind === 'delta'
-              ? appendSeg(message, patch.segment, patch.delta, maxLiveReasoningRef.current)
-              : patch.fn(message)
-        }
-        if (!cloned) {
-          next = prev.slice()
-          cloned = true
-        }
-        next[idx] = message
-      }
-      return next
-    })
+  // Ref mirroring "a foreground turn is currently streaming" so the standing
+  // attach can retry-later without re-rendering. Kept in step with abortRef,
+  // which is updated at each foreground send/done/error path.
+  const foregroundActiveRef = useRef(false)
+
+  const setUsage = useCallback((u: { used?: number; window?: number }) => {
+    if (u.used != null) setCtxUsed(u.used)
+    if (u.window != null) setCtxWindow(u.window)
   }, [])
-  const enqueuePatch = useCallback(
-    (id: string, fn: (m: ChatMessage) => ChatMessage) => {
-      patchQueue.current.push({ id, kind: 'apply', fn })
-      if (flushHandle.current == null) {
-        flushHandle.current = requestAnimationFrame(flushPatches)
-      }
-    },
-    [flushPatches],
-  )
-  const enqueueDelta = useCallback(
-    (id: string, segment: 'text' | 'reasoning', delta: string) => {
-      if (!delta) return
-      queueStreamDelta(patchQueue.current, id, segment, delta)
-      if (flushHandle.current == null) {
-        flushHandle.current = requestAnimationFrame(flushPatches)
-      }
-    },
-    [flushPatches],
-  )
-  // Flush any tail synchronously and cancel a pending frame — used at end of
-  // turn and on unmount so the last delta never lingers unrendered.
-  const drainPatches = useCallback(() => {
-    if (flushHandle.current != null) {
-      cancelAnimationFrame(flushHandle.current)
-      flushHandle.current = null
-    }
-    flushPatches()
-  }, [flushPatches])
+
+  // Streaming controller + hook: owns the RAF frame batcher and the standing
+  // attach reconnection loop. Every state change comes back through the
+  // setters below, so the controller stays framework-agnostic (see
+  // chatStreamController.test.mjs for the deterministic behavioural suite).
+  const chatStream = useChatStream({
+    setMessages,
+    setLive,
+    setAskId,
+    setTitle,
+    setUsage,
+    setError,
+    setStreaming,
+    showReasoningRef,
+    maxLiveReasoningRef,
+    isForegroundActiveRef: foregroundActiveRef,
+    errorFallback: t('chat.somethingWrong'),
+    authFailureMessage:
+      t('chat.attachAuthFailed') || 'Dashboard login expired — refresh and sign in again.',
+    conversationFallback: t('chat.conversation'),
+  })
 
   // Landing on a bare "/" resumes the last conversation, so switching back to
   // Chat continues where you were rather than starting over. The New button
@@ -627,7 +432,6 @@ export default function ChatPage() {
   useEffect(
     () => () => {
       abortRef.current?.()
-      if (flushHandle.current != null) cancelAnimationFrame(flushHandle.current)
     },
     [],
   )
@@ -643,6 +447,10 @@ export default function ChatPage() {
   const stop = useCallback(() => {
     abortRef.current?.()
     abortRef.current = null
+    foregroundRunRef.current = null
+    foregroundOwnerRef.current = undefined
+    localSessionRef.current = null
+    foregroundActiveRef.current = false
     setStreaming(false)
     if (sessionId) {
       void post<{ interrupted: boolean }>('/chat/interrupt', { session_id: sessionId }).catch(() => {
@@ -652,233 +460,13 @@ export default function ChatPage() {
     }
   }, [sessionId])
 
-  // Apply one stream event to the named assistant message. Shared by a fresh
-  // send and a reattach, so both render a turn identically. Session handling
-  // differs between the two (navigate vs. title-only), so it is delegated.
-  const applyEvent = useCallback(
-    (
-      assistantId: string,
-      event: StreamEvent,
-      onSession?: (id: string, title?: string) => void,
-    ) => {
-      const patchAssistant = (fn: (m: ChatMessage) => ChatMessage) =>
-        enqueuePatch(assistantId, fn)
-      switch (event.type) {
-        case 'session':
-          onSession?.(
-            typeof event.id === 'string' ? event.id : '',
-            typeof event.title === 'string' ? event.title : undefined,
-          )
-          break
-        case 'text':
-          enqueueDelta(assistantId, 'text', String(event.delta ?? ''))
-          break
-        case 'reasoning':
-          // Honour display.show_reasoning even if a stale event arrives (server
-          // also suppresses when false; this keeps the UI consistent).
-          if (showReasoningRef.current) {
-            enqueueDelta(assistantId, 'reasoning', String(event.delta ?? ''))
-          }
-          break
-        case 'tool_call':
-          setLive((s) => ({
-            turn: s.turn + 1,
-            tool: String(event.name ?? ''),
-            notice: undefined,
-          }))
-          patchAssistant((m) =>
-            pushToolSeg(m, {
-              id: String(event.id ?? ''),
-              name: String(event.name ?? ''),
-              args: String(event.arguments ?? ''),
-              running: true,
-            }),
-          )
-          break
-        case 'tool_progress':
-          patchAssistant((m) =>
-            updateToolSeg(m, String(event.id ?? ''), (c) => ({
-              ...c,
-              // A chunk streams (append); a message is a status line (replace),
-              // so "attempt 1/3" → "attempt 2/3" swaps in place instead of
-              // concatenating.
-              progress:
-                event.chunk != null
-                  ? (c.progress ?? '') + String(event.chunk)
-                  : String(event.message ?? c.progress ?? ''),
-            })),
-          )
-          break
-        case 'tool_result':
-          setLive((s) => ({ ...s, tool: undefined }))
-          patchAssistant((m) =>
-            updateToolSeg(m, String(event.id ?? ''), (c) => ({
-              ...c,
-              result: String(event.content ?? ''),
-              isError: !!event.is_error,
-              running: false,
-            })),
-          )
-          break
-        case 'notice':
-          // Compaction, steering, retries, … — without this the UI only shows
-          // "Working… · Ns" during multi-minute silent server work.
-          setLive((s) => ({
-            ...s,
-            notice: String(event.message ?? event.content ?? '').trim() || undefined,
-          }))
-          break
-        case 'ask':
-          // The turn is now paused inside ask_user. Remember the id so the
-          // answer card can resume it; the stream stays open (no 'done').
-          setAskId(String(event.id ?? ''))
-          setLive((s) => ({ ...s, tool: undefined, waiting: true, notice: undefined }))
-          break
-        case 'usage':
-          patchAssistant((m) => ({
-            ...m,
-            tokensIn: Number(event.input_tokens ?? m.tokensIn ?? 0),
-            tokensOut: Number(event.output_tokens ?? m.tokensOut ?? 0),
-          }))
-          {
-            // context_tokens is the latest turn's input alone — what actually
-            // occupies the window right now — so context/window is the fill
-            // gauge. (input_tokens above is the run's cumulative total, which
-            // climbs past the window on long runs and must NOT feed the gauge.)
-            const win = Number(event.context_window ?? 0)
-            const used = Number(event.context_tokens ?? 0)
-            if (used > 0) setCtxUsed(used)
-            if (win > 0) setCtxWindow(win)
-          }
-          break
-        case 'reset':
-          // The turn is being retried after a provider glitch — throw away the
-          // partial reply so the retry does not render on top of it.
-          patchAssistant((m) => ({
-            ...m,
-            content: '',
-            reasoning: undefined,
-            toolCalls: undefined,
-            segments: [],
-            error: undefined,
-          }))
-          break
-        case 'error':
-          patchAssistant((m) => ({
-            ...m,
-            error: String(event.error ?? t('chat.somethingWrong')),
-          }))
-          break
-      }
-    },
-    [t, enqueuePatch, enqueueDelta],
-  )
 
   // Reconnect to a turn still running for this session (after navigating away
-  // and back). Replays from the given cursor, so no tokens are missed, and
-  // builds the assistant message lazily — if nothing is live, the server says
-  // done at once and no empty bubble appears. Returns a closer.
-  //
-  // The done handler ALWAYS re-hydrates the persisted session, regardless of
-  // whether any event arrived. That covers the race where the turn finished
-  // between the user navigating away and back: the initial hydrate in the
-  // outer useEffect ran against a stale DB snapshot (the assistant message
-  // is persisted at end-of-turn), and the attach's `done` is the earliest
-  // moment we know the canonical state is available. Skipping the re-fetch
-  // when no event came (the previous behaviour) left the chat showing the
-  // pre-turn state — the symptom that looked like "session disappeared".
-  const attachLive = useCallback(
-    (sid: string) => {
-      // A standing attachment: after a turn ends we reconnect, so a turn the
-      // SERVER starts later — a background sub-agent finishing and waking the
-      // main agent — streams in live without a refresh. `alive` gates the loop
-      // so the cleanup truly stops it.
-      let alive = true
-      let close: (() => void) | undefined
-      let assistantId: string | null = null
-      let cursor = 0
-      // The initial hydrate can race a turn finishing just before attach. Refresh
-      // once after the first idle `done` to close that race, then stop downloading
-      // and rebuilding the entire transcript on every 1.5-second idle poll.
-      let idleRefreshDone = false
-
-      const connect = () => {
-        if (!alive) return
-        // Never run the standing attach while a foreground send is streaming:
-        // that turn already renders via streamPost, and a second follower would
-        // double-render it. Retry shortly instead.
-        if (abortRef.current) {
-          window.setTimeout(connect, 1500)
-          return
-        }
-        const ensure = () => {
-          if (assistantId) return assistantId
-          assistantId = `live_${Date.now()}_a`
-          setMessages((prev) => [
-            ...prev,
-            { id: assistantId as string, role: 'assistant', content: '' },
-          ])
-          setStreaming(true)
-          setLive({ turn: 1 })
-          return assistantId
-        }
-        close = streamGet(
-          `/chat/attach?session_id=${encodeURIComponent(sid)}&cursor=${cursor}`,
-          (event) => {
-            const eventCursor = Number(event.cursor ?? cursor)
-            if (Number.isFinite(eventCursor) && eventCursor >= cursor) cursor = eventCursor
-            if (event.type === 'done') {
-              drainPatches()
-              setStreaming(false)
-              close?.() // stop EventSource from auto-reconnecting
-              const shouldRefresh = shouldRefreshAfterAttach(assistantId !== null, idleRefreshDone)
-              assistantId = null
-              idleRefreshDone = true
-              // A later server-initiated turn is a new liveRun with its own
-              // zero-based cursor. Reset only after the current run is done.
-              cursor = 0
-              const refresh = shouldRefresh
-                ? get<SessionDetail>(`/sessions/${sid}`)
-                    .then((d) => {
-                      if (!alive) return
-                      setMessages(hydrate(d))
-                      setTitle(d.session.title || t('chat.conversation'))
-                    })
-                    .catch(() => {})
-                : Promise.resolve()
-              // Do not overlap canonical hydration with the next attachment: a
-              // stale response could otherwise overwrite fresh live deltas.
-              void refresh.finally(() => {
-                if (alive) window.setTimeout(connect, 1500)
-              })
-              return
-            }
-            applyEvent(ensure(), event, (_id, evtTitle) => {
-              if (evtTitle) setTitle(evtTitle)
-            })
-          },
-          (err) => {
-            setStreaming(false)
-            close?.()
-            // Auth failure will not fix itself with a retry — stop the 3s 401
-            // loop that filled the daemon log after every restart.
-            if (err instanceof ApiError && err.status === 401) {
-              setError(t('chat.attachAuthFailed') || 'Dashboard login expired — refresh and sign in again.')
-              return
-            }
-            if (alive) window.setTimeout(connect, 3000)
-          },
-        )
-      }
-
-      connect()
-      return () => {
-        alive = false
-        close?.()
-      }
-    },
-    [applyEvent, drainPatches, t],
-  )
+  // and back). The controller replays from the last applied cursor so no
+  // tokens are missed, builds the assistant message lazily on the first live
+  // event, and re-hydrates the persisted session after a done — closing the
+  // race where the turn finished between navigation away and back.
+  const attachLive = chatStream.attach
 
   useEffect(() => {
     if (!sessionId) {
@@ -1065,6 +653,8 @@ export default function ChatPage() {
       id: `local_${Date.now()}`,
       role: 'user',
       content: text,
+      // Attach images/docs so Retry on a pre-hydrate failure can resend them.
+      images: attached.length > 0 ? attached : undefined,
       docs: attachedDocs.length > 0 ? attachedDocs : undefined,
     }
     const assistantId = `local_${Date.now()}_a`
@@ -1084,11 +674,17 @@ export default function ChatPage() {
     setDocs([])
     setError(undefined)
     setStreaming(true)
+    foregroundActiveRef.current = true
     setLive({ turn: 1 })
 
-    abortRef.current = streamPost(
-      '/chat',
-      {
+    // Dispose any run that was still winding down (transport already aborted,
+    // just silencing any in-flight callbacks) before starting a fresh one.
+    foregroundRunRef.current?.dispose()
+    foregroundOwnerRef.current = sessionIdRef.current
+    const run = chatStream.startRun({
+      assistantId,
+      path: '/chat',
+      body: {
         session_id: sessionIdRef.current ?? '',
         message,
         images: attached,
@@ -1099,78 +695,108 @@ export default function ChatPage() {
         // Per-turn reasoning override; omitted when unset so the server falls
         // back to the configured default.
         ...(reasoning ? { reasoning_effort: reasoning } : {}),
-        // Only meaningful when starting a new session; the server ignores it once
-        // the session exists. Read from the ref so an auto-analyze turn fired
-        // right after binding still carries the project.
+        // Only meaningful when starting a new session; the server ignores it
+        // once the session exists. Read from the ref so an auto-analyze turn
+        // fired right after binding still carries the project.
         ...(projectDirRef.current && !sessionIdRef.current
           ? { project_dir: projectDirRef.current, index_rag: indexRagRef.current }
           : {}),
       },
-      (event: StreamEvent) => {
-        // End-of-turn: stop streaming immediately rather than waiting for the
-        // socket to close. A detached run keeps the connection open past the
-        // final event, which otherwise left the indicator and the task bar
-        // "running" forever.
-        if (event.type === 'done') {
-          drainPatches() // render the final buffered deltas before we stop
-          setStreaming(false)
-          setAskId(undefined)
-          setLive((s) => ({ ...s, waiting: false }))
-          abortRef.current?.()
-          abortRef.current = null
-          localSessionRef.current = null
-          // The turn may have written project_info — refresh the sidebar.
-          setSidebarRefresh((n) => n + 1)
-          // Re-hydrate from the persisted turn so the optimistic you_/local_
-          // message ids become their real DB ids. Without this the edit/revert
-          // affordance never appears until a manual reload, since it is hidden
-          // for optimistic ids (see MessageBubble). Mirrors the attach path.
-          const sid = sessionIdRef.current
-          if (sid) {
-            get<SessionDetail>(`/sessions/${sid}`)
-              .then((d) => {
-                setMessages(hydrate(d))
-                setTitle(d.session.title || t('chat.conversation'))
-              })
-              .catch(() => {})
-          }
-          return
+      currentSessionId: () => sessionIdRef.current,
+      onSession: (id) => {
+        if (!id) return
+        // Adopt the real session id at once so the next message posts to it
+        // rather than opening another session.
+        sessionIdRef.current = id
+        // The run's owning session was undefined for a brand-new chat; update
+        // it here so the sessionId-change effect below won't tear the run down
+        // when the URL adoption navigate() fires.
+        foregroundOwnerRef.current = id
+        if (id !== sessionId) {
+          // The server assigned this id — either a brand-new chat, or the one
+          // in the url was stale/missing so a fresh session was created.
+          // Point the url at the real session (and remember it so the hydrate
+          // the navigation triggers does not overwrite the live messages).
+          localSessionRef.current = id
+          lastSession.set(id)
+          navigate(`/c/${id}`, { replace: true })
         }
-        applyEvent(assistantId, event, (id, evtTitle) => {
-          if (id) {
-            // Adopt the real session id at once, so the next message posts to it
-            // rather than opening another session.
-            sessionIdRef.current = id
-            if (id !== sessionId) {
-              // The server assigned this id — either a brand-new chat, or the
-              // one in the url was stale/missing so a fresh session was created.
-              // Point the url at the real session (and remember it so the hydrate
-              // the navigation triggers does not overwrite the live messages).
-              localSessionRef.current = id
-              lastSession.set(id)
-              navigate(`/c/${id}`, { replace: true })
-            }
-          }
-          if (evtTitle) setTitle(evtTitle)
-        })
       },
-      (err) => {
-        drainPatches()
-        setError(err.message)
+      onDone: () => {
+        // End-of-turn: stop streaming and clear per-run UI state immediately.
+        // The run handle and owner ref stay live until onSettled: an async
+        // hydrate is still in flight after done, and a route change between
+        // now and its resolve MUST be able to dispose() this run so the
+        // hydrate cannot overwrite a different session's transcript.
         setStreaming(false)
+        setAskId(undefined)
+        setLive((s) => ({ ...s, waiting: false }))
+        foregroundActiveRef.current = false
+        // The turn may have written project_info — refresh the sidebar.
+        setSidebarRefresh((n) => n + 1)
+      },
+      onError: (err) => {
+        // A server 'error' event may have already painted the bubble; a
+        // subsequent transport failure MUST NOT overwrite it with a generic
+        // wrapper of the same event.
+        const source: ChatMessage['errorSource'] =
+          err instanceof ApiError ? 'http' : 'transport'
+        const payload = normalizeErrorPayload(pickErrorText(err))
+        const retryPrompt = {
+          content: text,
+          images: attached.length > 0 ? attached : undefined,
+          docs: attachedDocs.length > 0 ? attachedDocs : undefined,
+        }
+        setMessages((prev) =>
+          prev.map((m) => {
+            if (m.id !== assistantId) return m
+            if (m.error) return m
+            return { ...m, error: payload, errorSource: source, retryPrompt }
+          }),
+        )
+        setStreaming(false)
+        foregroundActiveRef.current = false
+      },
+      onFinal: () => {
+        setStreaming(false)
+        foregroundActiveRef.current = false
+      },
+      onCleanEof: () => {
+        // Preserve any error the server already painted; only fill the gap
+        // when the socket truly ended with no signal at all.
+        const payload = normalizeErrorPayload(t('chat.streamEnded'))
+        const retryPrompt = {
+          content: text,
+          images: attached.length > 0 ? attached : undefined,
+          docs: attachedDocs.length > 0 ? attachedDocs : undefined,
+        }
+        setMessages((prev) =>
+          prev.map((m) => {
+            if (m.id !== assistantId) return m
+            if (m.error) return m
+            return { ...m, error: payload, errorSource: 'stream', retryPrompt }
+          }),
+        )
+      },
+      onSettled: () => {
+        // Fires only from an ALIVE run (controller guards dispose from
+        // echoing). Identity-check the ref so a hydrate that resolves late
+        // — after a new send/route change already assigned a fresh run —
+        // cannot wipe refs belonging to that fresh run.
+        if (foregroundRunRef.current !== run) return
         abortRef.current = null
-        // The turn is persisted now, so a later revisit should hydrate fresh.
+        foregroundRunRef.current = null
+        foregroundOwnerRef.current = undefined
         localSessionRef.current = null
       },
-      () => {
-        drainPatches()
-        setStreaming(false)
-        abortRef.current = null
-        localSessionRef.current = null
-      },
-    )
+    })
+    foregroundRunRef.current = run
+    // Legacy abort surface — stop() still calls this. dispose() aborts the
+    // socket AND silences every pending callback (event / error / final /
+    // rehydrate promise), so a switched-away session never mutates state.
+    abortRef.current = () => run.dispose()
     },
-    [role, reasoning, projectDir, streaming, sessionId, navigate, runCommand, applyEvent, drainPatches, t],
+    [role, reasoning, projectDir, streaming, sessionId, navigate, runCommand, chatStream, t],
   )
 
   const send = useCallback(() => {
@@ -1221,6 +847,35 @@ export default function ChatPage() {
       sendText(text)
     },
     [editing, sendText],
+  )
+
+  /** Resend the preceding user prompt (+ images/docs) for the errored turn.
+   *  Prefers the message's own retryPrompt (captured at error creation) so a
+   *  merged/reordered row still retries the correct prompt; falls back to a
+   *  walk-backwards for server-persisted rows. History stays intact. */
+  const retryTurn = useCallback(
+    (assistantMessageId: string) => {
+      // Synchronous ref guard beats the streaming-state re-render race.
+      if (foregroundActiveRef.current || streaming) return
+      const idx = messages.findIndex((m) => m.id === assistantMessageId)
+      if (idx < 0) return
+      const target = messages[idx]
+      if (target.retryPrompt) {
+        const p = target.retryPrompt
+        sendText(p.content, p.images ?? [], p.docs ?? [])
+        return
+      }
+      let user: ChatMessage | undefined
+      for (let i = idx - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+          user = messages[i]
+          break
+        }
+      }
+      if (!user) return
+      sendText(user.content, user.images ?? [], user.docs ?? [])
+    },
+    [messages, streaming, sendText],
   )
 
   // answerAsk delivers an ask_user answer to the paused turn. Unlike sending a
@@ -1637,6 +1292,8 @@ export default function ChatPage() {
                   onEdit={
                     streaming ? undefined : (id, content) => setEditing({ id, content })
                   }
+                  onRetry={retryTurn}
+                  retryDisabled={streaming}
                 />
               </div>
             </div>
@@ -1989,20 +1646,6 @@ function ContextBar({ used, window }: { used: number; window: number }) {
   )
 }
 
-function ErrorBanner({ message, className }: { message: string; className?: string }) {
-  return (
-    <div
-      className={cn(
-        'flex items-start gap-2 rounded-[var(--radius-sm)] border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive',
-        className,
-      )}
-    >
-      <Warning className="mt-0.5 size-4 shrink-0" weight="fill" />
-      <span className="min-w-0 break-words">{message}</span>
-    </div>
-  )
-}
-
 export function StreamingIndicator({
   turn,
   tool,
@@ -2051,251 +1694,3 @@ export function StreamingIndicator({
     </div>
   )
 }
-
-/**
- * Collapsible model-thinking block.
- *
- * Must NOT run the chat Markdown renderer on expand: reasoning traces are long
- * (tens of KB of decompiler/code-like text with many `*`/`[]`), and turning
- * that into hundreds of React nodes freezes the tab ("Page Unresponsive").
- * Plain pre-wrap text in a height-capped scroller is one DOM node, cheap to
- * open, and matches how thinking logs are meant to be read.
- *
- * Memoised for the same reason as ToolCallCard: on a message that grows to many
- * segments during one streaming turn, only the changed segment should re-render.
- * `text` is a primitive, so memo compares by value and finished blocks are free.
- */
-const ReasoningBlock = memo(function ReasoningBlock({ text }: { text: string }) {
-  const { t } = useI18n()
-  const [open, setOpen] = useState(false)
-  // Defer mounting the body to the next frame so the click paints first and
-  // Chrome does not treat the expand as a long task on the same turn.
-  const [bodyReady, setBodyReady] = useState(false)
-  useEffect(() => {
-    if (!open) {
-      setBodyReady(false)
-      return
-    }
-    const id = requestAnimationFrame(() => setBodyReady(true))
-    return () => cancelAnimationFrame(id)
-  }, [open])
-
-  return (
-    <div className="text-muted-foreground">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1.5 text-[11px] font-medium transition-colors hover:text-foreground"
-      >
-        <Brain className="size-3.5" />
-        {t('chat.reasoning')}
-        {text.length > 2000 ? (
-          <span className="font-normal text-muted-foreground/70">
-            ({Math.round(text.length / 1000)}k)
-          </span>
-        ) : null}
-        <CaretDown className={cn('size-3 transition-transform', open && 'rotate-180')} />
-      </button>
-      {open ? (
-        <div className="mt-1.5 max-h-80 overflow-y-auto overflow-x-hidden border-l-2 border-border pl-3">
-          {bodyReady ? (
-            <pre className="m-0 whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-muted-foreground">
-              {text}
-            </pre>
-          ) : (
-            <p className="m-0 text-[11px] text-muted-foreground/60">…</p>
-          )}
-        </div>
-      ) : null}
-    </div>
-  )
-})
-
-// A plain-text segment. Memoised so it is skipped when an unrelated segment on
-// the same message changes during streaming.
-const TextSegment = memo(function TextSegment({ text }: { text: string }) {
-  return (
-    <div className="text-[13px] leading-relaxed">
-      <Markdown content={text} />
-    </div>
-  )
-})
-
-// Memoised: a streaming turn mutates only the last message, but setMessages
-// hands a new array each token. Without memo every bubble in a long transcript
-// re-renders per token — the main source of lag. With stable props (message
-// reference unchanged for old turns, onAnswer via useCallback), React skips
-// them and only the changed bubble re-renders.
-export const MessageBubble = memo(function MessageBubble({
-  message,
-  showReasoning = true,
-  askActive,
-  onAnswer,
-  onEdit,
-}: {
-  message: ChatMessage
-  /** When false, hide reasoning blocks (display.show_reasoning). */
-  showReasoning?: boolean
-  // Whether an ask_user question is still awaiting an answer. When false the
-  // card locks (already answered, or the run ended).
-  askActive?: boolean
-  onAnswer?: (text: string) => void
-  // Edit this (user) message: re-send from here, optionally reverting file
-  // changes made since. Absent while streaming or for a local optimistic msg.
-  onEdit?: (id: string, content: string) => void
-}) {
-  const { t } = useI18n()
-  const timeAgo = useTimeAgo()
-  const [copied, setCopied] = useState(false)
-
-  const copy = async () => {
-    if (await copyText(message.content)) {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    }
-  }
-
-  if (message.role === 'user') {
-    // Full-width, quietly set apart with a left rule and a faint tint — the
-    // model's replies own the column, the prompt sits above them as context.
-    return (
-      <div className="fade-up space-y-2">
-        {message.images?.length ? (
-          <div className="flex flex-wrap gap-2">
-            {message.images.map((src, i) => (
-              <img
-                key={i}
-                src={src}
-                alt=""
-                className="max-h-48 rounded-[var(--radius-md)] border border-border object-contain"
-              />
-            ))}
-          </div>
-        ) : null}
-        {message.docs?.length ? (
-          <div className="flex flex-wrap gap-2">
-            {message.docs.map((d, i) => (
-              <div
-                key={i}
-                className="flex max-w-56 items-center gap-1.5 rounded-[var(--radius-sm)] border border-border bg-muted/40 px-2 py-1 text-xs"
-              >
-                <FileText className="size-4 shrink-0 text-muted-foreground" />
-                <span className="truncate" title={d.name}>
-                  {d.name}
-                </span>
-              </div>
-            ))}
-          </div>
-        ) : null}
-        {message.content ? (
-          <div className="group/user relative rounded-[var(--radius-md)] border-l-2 border-primary bg-muted/40 px-3.5 py-2.5">
-            <p className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-foreground">
-              {message.content}
-            </p>
-            {/* Edit affordance: re-send the conversation from this message,
-                optionally reverting file changes made after it. Only when an
-                onEdit handler is wired and the message has a real (persisted) id
-                — a local optimistic id cannot be edited server-side yet. */}
-            {onEdit && !message.id.startsWith('local_') && !message.id.startsWith('you_') ? (
-              <button
-                onClick={() => onEdit(message.id, message.content)}
-                title={t('edit.button')}
-                aria-label={t('edit.button')}
-                className="absolute -top-2 right-2 hidden items-center gap-1 rounded-full border border-border bg-background px-2 py-0.5 text-[10px] text-muted-foreground shadow-sm transition-colors hover:text-foreground group-hover/user:flex"
-              >
-                <PencilSimple className="size-3" />
-                {t('edit.button')}
-              </button>
-            ) : null}
-          </div>
-        ) : null}
-      </div>
-    )
-  }
-
-  // Slash-command output is not the model talking. Setting it apart keeps the
-  // transcript honest about what came from where.
-  if (message.role === 'system') {
-    return (
-      <div className="fade-up rounded-[var(--radius-md)] border border-border bg-muted/40 px-3.5 py-3">
-        <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-          <Terminal className="size-3" />
-          {t('chat.command')}
-        </div>
-        <div className="text-xs">
-          <Markdown content={message.content} />
-        </div>
-      </div>
-    )
-  }
-
-  return (
-    <div className="group min-w-0 space-y-1.5 fade-up">
-      {message.segments && message.segments.length > 0
-        ? message.segments.map((seg, i) => {
-            if (seg.kind === 'reasoning') {
-              if (!showReasoning) return null
-              return <ReasoningBlock key={`r${i}`} text={seg.text} />
-            }
-            if (seg.kind === 'tool') {
-              // todo calls surface in the sticky TaskBar, not inline.
-              if (seg.call.name === 'todo') return null
-              // ask_user renders as a question with clickable answers instead
-              // of a raw tool card.
-              if (seg.call.name === 'ask_user') {
-                return (
-                  <AskUserCard
-                    key={seg.call.id}
-                    call={seg.call}
-                    disabled={!askActive}
-                    onAnswer={onAnswer ?? (() => {})}
-                  />
-                )
-              }
-              return <ToolCallCard key={seg.call.id} call={seg.call} />
-            }
-            return <TextSegment key={`t${i}`} text={seg.text} />
-          })
-        : // Fallback for any message that predates the timeline model.
-          <>
-            {showReasoning && message.reasoning ? (
-              <ReasoningBlock text={message.reasoning} />
-            ) : null}
-            {message.toolCalls?.map((call) =>
-              call.name === 'todo' ? null : call.name === 'ask_user' ? (
-                <AskUserCard key={call.id} call={call} disabled={!askActive} onAnswer={onAnswer ?? (() => {})} />
-              ) : (
-                <ToolCallCard key={call.id} call={call} />
-              ),
-            )}
-            {message.content ? (
-              <div className="text-[13px] leading-relaxed">
-                <Markdown content={message.content} />
-              </div>
-            ) : null}
-          </>}
-
-      {message.error ? <ErrorBanner message={message.error} /> : null}
-
-      {message.content ? (
-        <div className="flex items-center gap-2 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
-          <Button variant="ghost" size="icon-sm" onClick={copy} aria-label={t('common.copy')}>
-            {copied ? (
-              <Check className="size-3.5 text-[var(--success)]" />
-            ) : (
-              <Copy className="size-3.5" />
-            )}
-          </Button>
-          {message.tokensOut ? (
-            <span className="text-[10px] text-muted-foreground">
-              {t('chat.tokensOut', { n: message.tokensOut })}
-            </span>
-          ) : null}
-          {message.createdAt ? (
-            <span className="text-[10px] text-muted-foreground">{timeAgo(message.createdAt)}</span>
-          ) : null}
-        </div>
-      ) : null}
-    </div>
-  )
-})

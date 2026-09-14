@@ -319,6 +319,14 @@ type Store interface {
 	ClearMemories(ctx context.Context, scope, scopeKey string) (int64, error)
 
 	PutChunks(ctx context.Context, chunks []Chunk) error
+	// ReplaceDocuments upserts chunks and, for each represented doc_id,
+	// deletes any surviving chunk_index strictly greater than the highest
+	// index in the batch. This is how a shrunken re-embed prunes its own
+	// tail without leaving unreachable rows in the collection.
+	ReplaceDocuments(ctx context.Context, collection string, chunks []Chunk) error
+	// DeleteDocuments removes every chunk belonging to the listed docIDs
+	// inside collection. Empty docIDs is a no-op; missing docs are ignored.
+	DeleteDocuments(ctx context.Context, collection string, docIDs []string) (int64, error)
 	SearchChunks(ctx context.Context, collection string, embedding []float32, text string, topK int, hybrid bool) ([]Chunk, []float64, error)
 	DeleteCollection(ctx context.Context, collection string) (int64, error)
 	ListCollections(ctx context.Context) ([]string, error)

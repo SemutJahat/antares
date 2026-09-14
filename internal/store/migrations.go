@@ -210,3 +210,103 @@ var postgresFTS = []string{
 	`CREATE INDEX IF NOT EXISTS idx_messages_fts ON messages USING GIN (to_tsvector('simple', content))`,
 	`CREATE INDEX IF NOT EXISTS idx_memories_fts ON memories USING GIN (to_tsvector('simple', content))`,
 }
+
+// sqliteV2 adds the RAG chunk lexical index (FTS5 with content-mirrored rows
+// and triggers, plus a one-shot backfill) and the collection-revision counter.
+// The FTS5 table is a plain (non-external-content) table so both DELETE and
+// UPDATE stay simple and consistent even if a future writer bypasses the
+// triggers by attaching to the DB directly — the triggers cover the standard
+// PutChunks / DeleteCollection paths and are enough for correctness.
+var sqliteV2 = []string{
+	`CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_fts USING fts5(
+		content, chunk_id UNINDEXED, collection UNINDEXED, tokenize='unicode61 remove_diacritics 2')`,
+	`INSERT INTO rag_chunks_fts(content, chunk_id, collection)
+	 SELECT content, id, collection FROM rag_chunks
+	 WHERE NOT EXISTS (SELECT 1 FROM rag_chunks_fts f WHERE f.chunk_id = rag_chunks.id)`,
+	`CREATE TRIGGER IF NOT EXISTS rag_chunks_fts_ins AFTER INSERT ON rag_chunks BEGIN
+		INSERT INTO rag_chunks_fts(content, chunk_id, collection) VALUES (new.content, new.id, new.collection);
+	END`,
+	`CREATE TRIGGER IF NOT EXISTS rag_chunks_fts_upd AFTER UPDATE ON rag_chunks BEGIN
+		DELETE FROM rag_chunks_fts WHERE chunk_id = old.id;
+		INSERT INTO rag_chunks_fts(content, chunk_id, collection) VALUES (new.content, new.id, new.collection);
+	END`,
+	`CREATE TRIGGER IF NOT EXISTS rag_chunks_fts_del AFTER DELETE ON rag_chunks BEGIN
+		DELETE FROM rag_chunks_fts WHERE chunk_id = old.id;
+	END`,
+
+	`CREATE TABLE IF NOT EXISTS rag_collection_revisions (
+		collection TEXT PRIMARY KEY,
+		revision   BIGINT NOT NULL DEFAULT 0,
+		dims       INTEGER NOT NULL DEFAULT 0
+	)`,
+	// Backfill (collection, dims) from existing rows so a legacy collection
+	// already stores the shape it was built with; the app-level guard reads
+	// this row to reject any new write with a different dimensionality.
+	// length(embedding)/4 assumes the encodeEmbedding little-endian float32
+	// packing that shipped with v1 (4 bytes per component). Rows sharing a
+	// collection MUST share dims — this SELECT pins the largest observed
+	// blob length so a mixed-legacy collection surfaces on the next write.
+	`INSERT INTO rag_collection_revisions(collection, revision, dims)
+	 SELECT collection, 0, MAX(length(embedding)/4) FROM rag_chunks
+	 WHERE embedding IS NOT NULL
+	 GROUP BY collection
+	 ON CONFLICT(collection) DO UPDATE SET dims =
+	   CASE WHEN rag_collection_revisions.dims = 0
+	        THEN excluded.dims
+	        ELSE rag_collection_revisions.dims END`,
+	`CREATE TRIGGER IF NOT EXISTS rag_chunks_rev_ins AFTER INSERT ON rag_chunks BEGIN
+		INSERT INTO rag_collection_revisions(collection, revision) VALUES (new.collection, 1)
+		ON CONFLICT(collection) DO UPDATE SET revision = revision + 1;
+	END`,
+	`CREATE TRIGGER IF NOT EXISTS rag_chunks_rev_upd AFTER UPDATE ON rag_chunks BEGIN
+		INSERT INTO rag_collection_revisions(collection, revision) VALUES (new.collection, 1)
+		ON CONFLICT(collection) DO UPDATE SET revision = revision + 1;
+	END`,
+	`CREATE TRIGGER IF NOT EXISTS rag_chunks_rev_del AFTER DELETE ON rag_chunks BEGIN
+		INSERT INTO rag_collection_revisions(collection, revision) VALUES (old.collection, 1)
+		ON CONFLICT(collection) DO UPDATE SET revision = revision + 1;
+	END`,
+}
+
+// postgresV2 mirrors sqliteV2 using tsvector/GIN for the lexical index and
+// row-level triggers for the revision counter. Extension-free — no pgvector,
+// no pg_trgm — the tsvector is expression-indexed inline.
+var postgresV2 = []string{
+	`CREATE INDEX IF NOT EXISTS idx_rag_chunks_fts ON rag_chunks USING GIN (to_tsvector('simple', content))`,
+
+	`CREATE TABLE IF NOT EXISTS rag_collection_revisions (
+		collection TEXT PRIMARY KEY,
+		revision   BIGINT NOT NULL DEFAULT 0,
+		dims       INTEGER NOT NULL DEFAULT 0
+	)`,
+	`INSERT INTO rag_collection_revisions(collection, revision, dims)
+	 SELECT collection, 0, MAX(octet_length(embedding)/4) FROM rag_chunks
+	 WHERE embedding IS NOT NULL
+	 GROUP BY collection
+	 ON CONFLICT(collection) DO UPDATE SET dims =
+	   CASE WHEN rag_collection_revisions.dims = 0
+	        THEN EXCLUDED.dims
+	        ELSE rag_collection_revisions.dims END`,
+	`CREATE OR REPLACE FUNCTION rag_chunks_rev_bump() RETURNS TRIGGER AS $$
+	BEGIN
+		IF (TG_OP = 'DELETE') THEN
+			INSERT INTO rag_collection_revisions(collection, revision) VALUES (OLD.collection, 1)
+			ON CONFLICT(collection) DO UPDATE SET revision = rag_collection_revisions.revision + 1;
+			RETURN OLD;
+		ELSE
+			INSERT INTO rag_collection_revisions(collection, revision) VALUES (NEW.collection, 1)
+			ON CONFLICT(collection) DO UPDATE SET revision = rag_collection_revisions.revision + 1;
+			RETURN NEW;
+		END IF;
+	END;
+	$$ LANGUAGE plpgsql`,
+	`DROP TRIGGER IF EXISTS rag_chunks_rev_ins ON rag_chunks`,
+	`CREATE TRIGGER rag_chunks_rev_ins AFTER INSERT ON rag_chunks
+		FOR EACH ROW EXECUTE FUNCTION rag_chunks_rev_bump()`,
+	`DROP TRIGGER IF EXISTS rag_chunks_rev_upd ON rag_chunks`,
+	`CREATE TRIGGER rag_chunks_rev_upd AFTER UPDATE ON rag_chunks
+		FOR EACH ROW EXECUTE FUNCTION rag_chunks_rev_bump()`,
+	`DROP TRIGGER IF EXISTS rag_chunks_rev_del ON rag_chunks`,
+	`CREATE TRIGGER rag_chunks_rev_del AFTER DELETE ON rag_chunks
+		FOR EACH ROW EXECUTE FUNCTION rag_chunks_rev_bump()`,
+}

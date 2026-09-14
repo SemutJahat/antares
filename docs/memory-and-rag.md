@@ -78,18 +78,37 @@ Collections keep bodies separate so a search can be scoped.
 
 ### How it works (native, in-process)
 
-Retrieval is built in — no external daemon. Vectors live in the Antares
-database, embedded with your configured model. A query runs a four-stage
-pipeline:
+Retrieval is built in — no external daemon, and no database extension.
+Vectors live in the Antares database, embedded with your configured model.
+A query runs a four-stage pipeline:
 
-1. **Recall** — hybrid search pulls `recall` candidates (default 40), fusing
-   dense similarity with lexical matching (good for code and exact identifiers).
+1. **Recall** — hybrid search pulls `recall` candidates (default 40). The
+   dense side runs against a per-collection HNSW graph cached in-process;
+   the graph is built lazily on the first search and invalidated by a
+   persisted revision counter, so an out-of-process writer stays visible
+   without a manual refresh. The lexical side uses the same full-text
+   index the rest of the app uses — FTS5 on SQLite, `tsvector`/GIN on
+   Postgres — so no extension is needed on either backend, in particular
+   not `pgvector`. When `hybrid` is on, dense and lexical hits are fused
+   with reciprocal-rank fusion.
 2. **Rerank** — the candidates are reordered by relevance to the query.
-   `rerank_mode: llm` (default) has an auxiliary model score them; `api` calls an
-   external reranker (`rerank_url` + `rerank_api_key`, Voyage/Jina/Cohere-shaped);
-   `off` keeps retrieval order. Rerank is separate from embedding.
-3. **Compress** — with `compress: true`, near-duplicate results are collapsed.
+   `rerank_mode: llm` (default) has an auxiliary model score them; `api`
+   calls an external reranker (`rerank_url` + `rerank_api_key`,
+   Voyage/Jina/Cohere-shaped); `off` keeps retrieval order. Rerank is
+   separate from embedding.
+3. **Compress** — with `compress: true`, near-duplicate results are
+   collapsed.
 4. **Top-K** — the best `top_k` (default 8) are returned.
+
+The graph trades a one-time build cost and some resident memory for a
+per-query cost that no longer scales with the collection size — a rebuild
+is a full scan of the collection's embeddings and the cache holds one
+graph per active collection. On very small collections a straight SQL
+scan can beat the graph, and the crossover depends on both size and
+embedding dimensionality; the intent is that larger, higher-dimensional
+corpora — the ones where a scan is actually painful — are the ones the
+graph helps. Benchmarks live next to the code
+(`go test ./internal/store -run TestVectorIndex -bench BenchmarkVectorIndex`).
 
 ### Auto-context (living memory)
 

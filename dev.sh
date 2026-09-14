@@ -35,7 +35,7 @@ fi
 echo -e "${CYAN}Antares Dev${NC}"
 echo -e "  Backend: ${GREEN}http://localhost:8787${NC}"
 echo -e "  Frontend: ${GREEN}http://localhost:${VITE_PORT:-5174}${NC}"
-echo -e "  ${YELLOW}Open http://localhost:5173 in your browser${NC}"
+echo -e "  ${YELLOW}Open http://localhost:${VITE_PORT:-5174} in your browser${NC}"
 echo ""
 
 # Backend: hot reload via air
@@ -50,7 +50,7 @@ BACKEND_PID=$!
 VITE_PORT="${VITE_PORT:-5174}"
 (
   cd "$ROOT/web"
-  "$BUN" x vite --host 0.0.0.0 --port "$VITE_PORT"
+  "$BUN" x vite --port "$VITE_PORT"
 ) &
 FRONTEND_PID=$!
 

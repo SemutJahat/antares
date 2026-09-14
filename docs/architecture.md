@@ -41,10 +41,26 @@ web/                  the React dashboard
 
 ## Choices worth explaining
 
-**Go, standard library.** One static binary, nothing to install on the target,
-low idle memory. `net/http` method-and-pattern routing covers every route here,
-so there is no router dependency. Three dependencies in total: a YAML parser and
-two database drivers.
+**Go, standard library where it can be.** One static binary, nothing to
+install on the target, low idle memory. `net/http` method-and-pattern
+routing covers every route here, so there is no router dependency; the
+`database/sql` layer serves both SQLite and Postgres; `embed` carries the
+dashboard. Direct dependencies are the ones with no reasonable in-tree
+substitute — `yaml.v3`, the two database drivers (`pgx` and
+`modernc/sqlite`, both pure Go), an in-process HNSW graph for RAG, a
+browser-fingerprinted HTTP stack for `http_request`, the Bubble Tea stack
+for the TUI, and a few narrow utilities (SFTP, IMAP, PDF text). `go.mod`
+is the authoritative list.
+
+Schema upgrades use a transactional `schema_migrations` version/checksum ledger.
+Legacy databases are adopted without deleting records. Unknown newer versions,
+missing ledger versions, and changed migration checksums are rejected. SQLite
+serializes upgrades with a writer lock; PostgreSQL uses a transaction advisory lock.
+
+RAG caches one HNSW graph per collection in process. A persisted revision detects
+changes from other writers. Graph rebuilds read a consistent database snapshot;
+warm queries fetch only candidate rows. Hybrid retrieval combines dense candidates
+with FTS5 or PostgreSQL GIN lexical candidates using reciprocal-rank fusion.
 
 **One `Store` interface.** SQLite and Postgres behind the same methods. Two
 things make that work: timestamps stored as unix milliseconds so both dialects
@@ -68,10 +84,10 @@ file to copy anywhere. In development Vite serves the UI and proxies the API.
 
 ## The dashboard
 
-`web/src/lib/routes.ts` is the single source of navigation, routing, and page
-chrome. `AppShell` renders the frame; pages contain content only. That is why
-every page has the same padding and the same header, and why adding one is a
-single entry.
+`web/src/lib/routeManifest.ts` defines route metadata shared by navigation and
+browser smoke checks. `routes.ts` attaches icons and lazy page components.
+`AppShell` renders page chrome. English loads eagerly; other locale dictionaries
+load only when selected. Development sample routes are excluded from production.
 
 Built with React 19, Vite, Tailwind v4 with oklch tokens, Radix primitives, and
 Phosphor icons. Five languages, English by default.
@@ -104,7 +120,8 @@ Go tests cover the cron parser, provider adapters, the MCP client, the store
 against both drivers, the WebSocket client, the hub, the harness, and the
 browser against a real Chromium.
 
-The dashboard is checked by loading every route in a headless browser, taking
-screenshots at desktop and mobile widths, and asserting no horizontal overflow.
+The dashboard smoke check loads every manifest route and alias in a headless
+browser at desktop and mobile widths, asserting no redirects, exceptions, blank
+pages, or horizontal overflow. It uses an isolated authenticated fixture.
 That exists because two of the worst bugs so far passed every type check and
 blanked the entire page. Nothing static catches that class of failure.

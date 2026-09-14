@@ -81,7 +81,7 @@ const approvalTimeout = 5 * time.Minute
 func (a *Agent) checkApproval(ctx context.Context, call llm.ToolCall, tool tools.Tool, sessionID string, emit Emit) *tools.Result {
 	mode := strings.ToLower(strings.TrimSpace(a.config().Tools.ApprovalMode))
 	if mode == "" {
-		mode = "auto"
+		mode = "prompt"
 	}
 
 	danger := dangerIn(call.Name, call.Arguments)

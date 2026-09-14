@@ -69,8 +69,9 @@ type Server struct {
 	// Production uses net.DefaultResolver.
 	providerResolver providerIPResolver
 
-	mu       sync.RWMutex
-	reloadFn func() error
+	mu            sync.RWMutex
+	configWriteMu sync.Mutex
+	reloadFn      func() error
 
 	// dashSessions holds active dashboard login session tokens (cookie value →
 	// expiry). Guarded by its own mutex; cleared when the password changes.
@@ -146,11 +147,11 @@ func (s *Server) Handler() http.Handler {
 
 // Addr returns the configured listen address.
 func (s *Server) Addr() string {
-	host := s.cfg.Server.Host
+	host := s.config().Server.Host
 	if host == "" {
-		host = "0.0.0.0"
+		host = "127.0.0.1"
 	}
-	return net.JoinHostPort(host, strconv.Itoa(s.cfg.Server.Port))
+	return net.JoinHostPort(host, strconv.Itoa(s.config().Server.Port))
 }
 
 // SetConfig swaps the live configuration after a reload.
@@ -316,6 +317,10 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		if cfg.Server.DashboardLocked() && s.dashSessionValid(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 
 		presented := ""
 		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
@@ -420,6 +425,9 @@ func (s *sseWriter) comment(text string) {
 
 // Serve runs the HTTP server until ctx is cancelled.
 func (s *Server) Serve(ctx context.Context) error {
+	if err := s.config().Server.ValidateListen(); err != nil {
+		return err
+	}
 	srv := &http.Server{
 		Addr:              s.Addr(),
 		Handler:           s.Handler(),

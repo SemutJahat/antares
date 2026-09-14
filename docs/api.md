@@ -56,6 +56,10 @@ id assigned.
 | `error` | `error` | The turn failed |
 | `done` | | Terminal — always last |
 
+Terminal failures are also stored as assistant rows with `meta.is_error=true`.
+Their `content` is a one-field JSON object (`{"error":"..."}`), so the
+dashboard can render the failure after a reload and retry the preceding prompt.
+
 ### `POST /api/chat/interrupt`
 
 ```json
@@ -177,6 +181,10 @@ not a transport error.
 ```
 
 `400` for a bad request, `401` for a missing or wrong token, `404` for an
-unknown path, `500` for a failure inside. Endpoints where failure is an ordinary
-outcome — installing, verifying a key, running a command — return `200` with
-`ok: false` instead, so the caller can show the message rather than a banner.
+unknown path, `409` when a session is already busy or setup has already
+completed, `429` when a request would exceed `max_concurrent_sessions`
+(the running top-level turn budget; `0` means unlimited), and `500` for a
+failure inside. Endpoints where failure is an ordinary outcome —
+installing, verifying a key, running a command — return `200` with
+`ok: false` instead, so the caller can show the message rather than a
+banner.

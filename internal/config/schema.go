@@ -22,6 +22,7 @@ type Field struct {
 	Secret  bool     `json:"secret"`
 	Enum    []string `json:"enum,omitempty"`
 	Help    string   `json:"help,omitempty"`
+	Reload  string   `json:"reload"`
 }
 
 // Tiers a field can belong to.
@@ -127,15 +128,16 @@ var help = map[string]string{
 	"model.context_window":                 "Used to decide when to compact; set it to match your model.",
 	"database.driver":                      "sqlite for a single node, postgres when you share state.",
 	"database.dsn":                         "sqlite: a file path. postgres: postgres://user:pass@host:5432/db?sslmode=disable",
-	"server.auth_token":                    "Leave empty to keep the dashboard open — sensible behind a private network.",
+	"server.auth_token":                    "Bearer API credential. A non-loopback listener requires this or a dashboard password unless auth_disabled is explicitly enabled.",
 	"server.host":                          "0.0.0.0 exposes it on every interface; 127.0.0.1 keeps it local.",
 	"agent.workspace":                      "The only directory file tools may read or write.",
 	"agent.system_prompt_extra":            "Appended to the system prompt on every turn.",
 	"tools.toolset":                        "Preset deciding which tools reach the model.",
-	"tools.approval_mode":                  "auto runs mutating tools directly; deny blocks them.",
+	"tools.approval_mode":                  "prompt asks before mutations; auto runs them directly; deny refuses them.",
 	"rag.rerank_mode":                      "How to reorder results: llm (an auxiliary model scores them), api (an external reranker), or off.",
 	"rag.embed_model":                      "The embedding model for indexing and search, e.g. text-embedding-3-small.",
 	"rag.per_user":                         "Keep a separate memory per chat user (Discord/Telegram), so the agent can recall topics and facts about each specific person. Stores cross-conversation data about individuals; off by default.",
+	"max_concurrent_sessions":              "Maximum simultaneous top-level turns across all entrypoints. Zero is unlimited; nested delegation uses its own limits.",
 	"compression.threshold":                "Fraction of the context window that triggers automatic compaction.",
 	"terminal.backend":                     "local runs on this machine; docker and ssh sandbox it elsewhere.",
 	"memory.memory_enabled":                "Lets the agent store durable facts between sessions.",
@@ -176,6 +178,9 @@ func humanize(s string) string {
 func Schema() []Field {
 	var out []Field
 	walk(reflect.ValueOf(*Default()), "", "", &out)
+	for i := range out {
+		out[i].Reload = ReloadMode(out[i].Path)
+	}
 	return out
 }
 

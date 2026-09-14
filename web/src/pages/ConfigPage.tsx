@@ -45,11 +45,13 @@ interface Field {
   secret: boolean
   enum?: string[]
   help?: string
+  reload: 'live' | 'reconciled' | 'restart_required'
 }
 
 interface ConfigResponse {
   values: Record<string, unknown>
   schema: Field[]
+  restart_fields?: string[]
 }
 
 const ESSENTIALS = '__essentials'
@@ -87,6 +89,7 @@ export default function ConfigPage() {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState<string>()
+  const [restartFields, setRestartFields] = useState<string[]>([])
   const [filter, setFilter] = useState('')
   const [revealed, setRevealed] = useState<Record<string, boolean>>({})
   const [yamlDraft, setYamlDraft] = useState<string | null>(null)
@@ -136,6 +139,7 @@ export default function ConfigPage() {
 
   // Reset disclosure when moving between sections.
   useEffect(() => setShowAdvanced(false), [section])
+  useEffect(() => setRestartFields(data?.restart_fields ?? []), [data])
 
   const valueOf = (f: Field): unknown => {
     if (f.path in edits) return edits[f.path]
@@ -153,7 +157,8 @@ export default function ConfigPage() {
     setSaving(true)
     setError(undefined)
     try {
-      await post('/config', { updates: edits })
+      const result = await post<{ restart_fields: string[] }>('/config', { updates: edits })
+      setRestartFields(result.restart_fields)
       setEdits({})
       setSaved(true)
       reload()
@@ -170,7 +175,8 @@ export default function ConfigPage() {
     setSaving(true)
     setError(undefined)
     try {
-      await post('/config/raw', { yaml: yamlDraft })
+      const result = await post<{ restart_fields: string[] }>('/config/raw', { yaml: yamlDraft })
+      setRestartFields(result.restart_fields)
       setYamlDraft(null)
       reload()
       rawState.reload()
@@ -222,6 +228,11 @@ export default function ConfigPage() {
           <Warning className="mt-0.5 size-4 shrink-0" weight="fill" />
           <span className="min-w-0 break-words">{error}</span>
         </div>
+      ) : null}
+      {restartFields.length > 0 ? (
+        <p role="status" className="break-words rounded-[var(--radius-sm)] border border-border bg-muted p-3 text-sm">
+          {t('config.restartPending', { fields: restartFields.join(', ') })}
+        </p>
       ) : null}
 
       <div className="relative lg:shrink-0">
@@ -518,7 +529,7 @@ function ListInput({
   // the raw text parses to (e.g. after Save/reload), not on every keystroke.
   useEffect(() => {
     const parsed = text.split(',').map((s) => s.trim()).filter(Boolean)
-    if (parsed.join(' ') !== (Array.isArray(value) ? (value as string[]).join(' ') : '')) {
+    if (parsed.join('\x00') !== (Array.isArray(value) ? (value as string[]).join('\x00') : '')) {
       setText(joined)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -553,6 +564,9 @@ function FieldLabel({
         <Label className={cn('text-sm', dirty && 'text-primary')}>{field.label}</Label>
         {showGroup ? <Badge variant="outline">{humanizeGroup(field.group)}</Badge> : null}
         {dirty ? <Badge>{t('config.changed')}</Badge> : null}
+        <span className="text-xs text-muted-foreground">
+          {t(field.reload === 'restart_required' ? 'config.reloadRestart' : field.reload === 'reconciled' ? 'config.reloadReconciled' : 'config.reloadLive')}
+        </span>
       </div>
       <p className="truncate font-mono text-[10px] text-muted-foreground/70">{field.path}</p>
     </>

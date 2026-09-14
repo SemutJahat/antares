@@ -9,8 +9,28 @@ permissions:
   contents: read
 
 jobs:
+  # Go tests must never depend on live provider credentials. The Postgres
+  # service is only wired in here so store tests gated on TEST_POSTGRES_DSN
+  # actually run in CI — a local expendable database, never anything a
+  # developer relies on.
   go:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: antares
+          POSTGRES_PASSWORD: antares
+          POSTGRES_DB: antares_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U antares -d antares_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_POSTGRES_DSN: postgres://antares:antares@127.0.0.1:5432/antares_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -45,3 +65,38 @@ jobs:
         run: bun x tsc -b --noEmit
       - name: Production build
         run: bun run build
+
+  # End-to-end dashboard smoke: build the real binary, boot it on an isolated
+  # temp home with a synthetic password and a loopback provider stub, then
+  # walk every route in headless Chrome. Uses `google-chrome-stable` as the
+  # explicit CHROME so smoke.mjs cannot fall back to an unrelated Chromium
+  # someone installed on the runner.
+  smoke:
+    runs-on: ubuntu-latest
+    needs: [go, web]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install web deps
+        working-directory: web
+        run: bun install --frozen-lockfile
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+        id: setup-chrome
+        with:
+          chrome-version: stable
+      - name: Smoke
+        env:
+          CHROME: ${{ steps.setup-chrome.outputs.chrome-path }}
+        # `make smoke` builds both bin/antares and bin/smokefixture (the
+        # shipped release binary is built by plain `make build` and never
+        # bundles the fixture) then runs scripts/smoke-run.mjs, which owns
+        # port pick, isolated ANTARES_HOME, provider stub, readiness, and
+        # cleanup.
+        run: make smoke

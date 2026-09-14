@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/primitives'
 import { Markdown } from '@/components/chat/Markdown'
-import type { ToolCallView } from '@/pages/ChatPage'
+import type { ToolCallView } from '@/lib/chatTranscript'
 
 interface AskQuestion {
   question: string

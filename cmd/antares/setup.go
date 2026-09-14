@@ -111,7 +111,7 @@ func runWebSetup(ctx context.Context, rt *runtimeServices) error {
 		Skills: rt.skills, Cron: rt.cron, Gateway: rt.gateway, MCP: rt.mcp,
 	})
 
-	urls := setupURLs(port)
+	urls := []string{"http://" + srv.Addr() + "/setup"}
 	fmt.Println()
 	fmt.Println("  Open this in your browser to finish setup:")
 	for _, u := range urls {

@@ -1,5 +1,7 @@
 /** Typed client for the Antares HTTP API. */
 
+import { consumeSseStream } from './sse'
+
 /** True when an error is the "set a dashboard password first" 428 gate. */
 export function isDashboardPasswordRequired(e: unknown): boolean {
   return e instanceof ApiError && e.status === 428
@@ -80,11 +82,12 @@ export const put = <T,>(path: string, data?: unknown) =>
   api<T>(path, { method: 'PUT', body: data === undefined ? undefined : JSON.stringify(data) })
 export const del = <T,>(path: string) => api<T>(path, { method: 'DELETE' })
 
-/** Fetch a file endpoint (with auth) and trigger a browser download. */
 /**
  * Build a same-origin URL to an API GET endpoint with the auth token in the
- * query string. Use for <img src>, <video>, and download links — places that
- * cannot set an Authorization header. The token middleware accepts ?token=.
+ * query string. Use for `<img src>`, `<video>`, and download links — places
+ * that cannot set an Authorization header. The token middleware accepts
+ * `?token=`. XHR/fetch call sites should use the Authorization header
+ * (`authHeaders()`) instead.
  */
 export function authedUrl(path: string): string {
   const token = getToken()
@@ -92,6 +95,7 @@ export function authedUrl(path: string): string {
   return `/api${path}${path.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`
 }
 
+/** Fetch a file endpoint (with auth) and trigger a browser download. */
 export async function downloadFile(path: string, filename: string): Promise<void> {
   const res = await fetch(`/api${path}`, { headers: { ...authHeaders() } })
   if (!res.ok) {
@@ -116,9 +120,113 @@ export interface StreamEvent {
   [key: string]: unknown
 }
 
+interface StreamHandlers {
+  onEvent: (event: StreamEvent) => void
+  onError?: (err: Error) => void
+  onDone?: () => void
+}
+
+/**
+ * Shared lifecycle for both SSE transports: build one request, consume the
+ * response through the shared parser, and guarantee that once aborted no
+ * further consumer callbacks fire and that `onDone` fires at most once.
+ *
+ * Uses `fetch` (not `EventSource`) so the dashboard session cookie
+ * (`credentials: 'include'`) and Authorization header travel with the
+ * request. `EventSource` cannot set headers, and after a daemon restart used
+ * to 401-loop when only a stale in-memory login map existed.
+ */
+function streamRequest(init: RequestInit & { url: string }, handlers: StreamHandlers): () => void {
+  const controller = new AbortController()
+  const { onEvent, onError, onDone } = handlers
+  // `settled` guards `onDone`/`onError` so each fires at most once. `aborted`
+  // is set the instant the caller invokes the returned disposer so any
+  // callback the parser is *about* to make is suppressed before it runs.
+  let settled = false
+  let aborted = false
+
+  const finish = () => {
+    if (settled) return
+    settled = true
+    onDone?.()
+  }
+  const fail = (err: Error) => {
+    if (settled) return
+    settled = true
+    onError?.(err)
+  }
+  const safeEvent = (event: StreamEvent) => {
+    if (aborted || settled) return
+    onEvent(event)
+  }
+
+  ;(async () => {
+    let res: Response
+    try {
+      const { url, ...rest } = init
+      res = await fetch(url, {
+        ...rest,
+        credentials: 'include',
+        signal: controller.signal,
+      })
+    } catch (err) {
+      const e = err as Error
+      if (e.name === 'AbortError' || aborted) finish()
+      else fail(e)
+      return
+    }
+
+    if (!res.ok || !res.body) {
+      // Drain the error body but distinguish a real HTTP failure from an
+      // in-flight abort that races the text read (which would masquerade as
+      // an empty error body).
+      let text = ''
+      try {
+        text = await res.text()
+      } catch (err) {
+        if (aborted || (err as Error).name === 'AbortError') {
+          finish()
+          return
+        }
+        // Unexpected body-read failure — surface as-is.
+        fail(err as Error)
+        return
+      }
+      if (aborted) {
+        finish()
+        return
+      }
+      fail(new ApiError(res.status, text || res.statusText))
+      return
+    }
+
+    try {
+      await consumeSseStream<StreamEvent>(res.body, {
+        onEvent: safeEvent,
+        // Malformed SSE frames from the daemon are transport noise, not user-
+        // visible errors; drop them silently as the previous code did.
+        onParseError: () => {},
+      })
+      finish()
+    } catch (err) {
+      // consumeSseStream cancelled the reader itself before rethrowing, so
+      // the body is already teardown-safe — just classify the error.
+      const e = err as Error
+      if (e.name === 'AbortError' || aborted) finish()
+      else fail(e)
+    }
+  })()
+
+  return () => {
+    if (aborted) return
+    aborted = true
+    controller.abort()
+  }
+}
+
 /**
  * POST a request and consume the server-sent event stream it returns.
- * Returns an abort function.
+ * Returns an abort function; late callbacks are suppressed after abort.
  */
 export function streamPost(
   path: string,
@@ -127,69 +235,27 @@ export function streamPost(
   onError?: (err: Error) => void,
   onDone?: () => void,
 ): () => void {
-  const controller = new AbortController()
-
-  ;(async () => {
-    try {
-      const res = await fetch(`/api${path}`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify(data),
-        signal: controller.signal,
-      })
-      if (!res.ok || !res.body) {
-        const text = await res.text().catch(() => '')
-        throw new ApiError(res.status, text || res.statusText)
-      }
-
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-
-        // SSE frames are separated by a blank line.
-        let idx: number
-        while ((idx = buffer.indexOf('\n\n')) !== -1) {
-          const frame = buffer.slice(0, idx)
-          buffer = buffer.slice(idx + 2)
-          const payload = frame
-            .split('\n')
-            .filter((l) => l.startsWith('data:'))
-            .map((l) => l.slice(5).replace(/^ /, ''))
-            .join('\n')
-          if (!payload || payload === '[DONE]') continue
-          try {
-            onEvent(JSON.parse(payload) as StreamEvent)
-          } catch {
-            /* ignore malformed frame */
-          }
-        }
-      }
-      onDone?.()
-    } catch (err) {
-      if ((err as Error).name === 'AbortError') {
-        onDone?.()
-        return
-      }
-      onError?.(err as Error)
-    }
-  })()
-
-  return () => controller.abort()
+  return streamRequest(
+    {
+      url: `/api${path}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+        ...authHeaders(),
+      },
+      body: JSON.stringify(data),
+    },
+    { onEvent, onError, onDone },
+  )
 }
 
 /**
  * Subscribe to a GET SSE endpoint (attach, logs, swarm, …).
  *
- * Uses fetch (not EventSource) so we can send the dashboard session cookie
- * (`credentials: 'include'`) and an Authorization header. EventSource cannot
- * set headers and after a daemon restart used to 401-loop when only a stale
- * in-memory login map existed — the cookie was valid but attach failed.
+ * The Authorization header is set from the stored token, so the legacy
+ * `?token=` query parameter is no longer appended here. Use `authedUrl` for
+ * media/download URLs that cannot carry headers.
  */
 export function streamGet(
   path: string,
@@ -197,61 +263,15 @@ export function streamGet(
   onError?: (err: Error) => void,
   onDone?: () => void,
 ): () => void {
-  const controller = new AbortController()
-  const token = getToken()
-  // Keep ?token= for allowlisted stream paths when a bearer is configured;
-  // cookie auth alone is enough for password-locked dashboards.
-  const url = `/api${path}${path.includes('?') ? '&' : '?'}${token ? `token=${encodeURIComponent(token)}` : ''}`
-
-  ;(async () => {
-    try {
-      const res = await fetch(url, {
-        method: 'GET',
-        credentials: 'include',
-        headers: { ...authHeaders(), Accept: 'text/event-stream' },
-        signal: controller.signal,
-      })
-      if (!res.ok || !res.body) {
-        const text = await res.text().catch(() => '')
-        throw new ApiError(res.status, text || res.statusText)
-      }
-
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-
-        let idx: number
-        while ((idx = buffer.indexOf('\n\n')) !== -1) {
-          const frame = buffer.slice(0, idx)
-          buffer = buffer.slice(idx + 2)
-          // Ignore SSE comments (keepalives: ": keepalive").
-          const payload = frame
-            .split('\n')
-            .filter((l) => l.startsWith('data:'))
-            .map((l) => l.slice(5).replace(/^ /, ''))
-            .join('\n')
-          if (!payload || payload === '[DONE]') continue
-          try {
-            onEvent(JSON.parse(payload) as StreamEvent)
-          } catch {
-            /* ignore malformed frame */
-          }
-        }
-      }
-      onDone?.()
-    } catch (err) {
-      if ((err as Error).name === 'AbortError') {
-        onDone?.()
-        return
-      }
-      onError?.(err as Error)
-    }
-  })()
-
-  return () => controller.abort()
+  return streamRequest(
+    {
+      url: `/api${path}`,
+      method: 'GET',
+      headers: {
+        Accept: 'text/event-stream',
+        ...authHeaders(),
+      },
+    },
+    { onEvent, onError, onDone },
+  )
 }

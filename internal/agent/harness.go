@@ -738,20 +738,37 @@ func (a *Agent) PruneCheckpoints(olderThan time.Duration) (int, error) {
 // ---- plugins -----------------------------------------------------------------
 
 // SetPlugins attaches the plugin manager. Passing nil disables hooks.
-func (a *Agent) SetPlugins(m *plugin.Manager) { a.plugins = m }
+// Publishes under servicesMu so a concurrent reader always sees a consistent
+// pointer during a live reload.
+func (a *Agent) SetPlugins(m *plugin.Manager) {
+	a.servicesMu.Lock()
+	a.plugins = m
+	a.servicesMu.Unlock()
+}
 
 // SetSocialBrowser attaches the persistent social media browser manager.
 func (a *Agent) SetSocialBrowser(m tools.SocialBrowserManager) { a.socialBrowser = m }
 
-// Plugins exposes the manager, or nil when none is attached.
-func (a *Agent) Plugins() *plugin.Manager { return a.plugins }
+// Plugins exposes the manager, or nil when none is attached. Callers must
+// reuse the returned pointer for the whole operation rather than re-reading,
+// so a concurrent SetPlugins cannot race a nil check against a later
+// dereference.
+func (a *Agent) Plugins() *plugin.Manager {
+	a.servicesMu.RLock()
+	m := a.plugins
+	a.servicesMu.RUnlock()
+	return m
+}
 
 // notifyPlugins sends an event that has no reply worth acting on.
 func (a *Agent) notifyPlugins(ctx context.Context, p plugin.Payload) {
-	if a.plugins == nil {
+	// Snapshot once: a concurrent SetPlugins between the nil check and the
+	// Dispatch would otherwise race a nil deref.
+	mgr := a.Plugins()
+	if mgr == nil {
 		return
 	}
-	a.plugins.Dispatch(ctx, p)
+	mgr.Dispatch(ctx, p)
 }
 
 // ---- multi-model panel -------------------------------------------------------
@@ -867,20 +884,35 @@ func (a *Agent) Panel(ctx context.Context, question string, models []string, emi
 
 // ---- roles -------------------------------------------------------------------
 
-// SetRoles attaches the role registry.
-func (a *Agent) SetRoles(r *roles.Registry) { a.roles = r }
+// SetRoles attaches the role registry. Publishes under servicesMu so a
+// concurrent reader always sees a consistent pointer during a live reload.
+func (a *Agent) SetRoles(r *roles.Registry) {
+	a.servicesMu.Lock()
+	a.roles = r
+	a.servicesMu.Unlock()
+}
 
-// Roles exposes the registry.
-func (a *Agent) Roles() *roles.Registry { return a.roles }
+// Roles exposes the registry. Callers must reuse the returned pointer for
+// the whole operation rather than re-reading, so a concurrent SetRoles cannot
+// race a nil check against a later use.
+func (a *Agent) Roles() *roles.Registry {
+	a.servicesMu.RLock()
+	r := a.roles
+	a.servicesMu.RUnlock()
+	return r
+}
 
 // applyRole folds a named role's prompt, toolset, and model into the request.
 // The role's values fill only what the request left blank, so an explicit
 // override on the request wins.
 func (a *Agent) applyRole(req *Request) {
-	if a.roles == nil || strings.TrimSpace(req.Role) == "" {
+	// One snapshot for the whole operation: a live SetRoles between the nil
+	// check and Get would otherwise race.
+	reg := a.Roles()
+	if reg == nil || strings.TrimSpace(req.Role) == "" {
 		return
 	}
-	role, ok := a.roles.Get(req.Role)
+	role, ok := reg.Get(req.Role)
 	if !ok {
 		return
 	}
@@ -907,10 +939,11 @@ func (a *Agent) applyRole(req *Request) {
 
 // roleInfos exposes the roles to the tools layer.
 func (a *Agent) roleInfos() []tools.RoleInfo {
-	if a.roles == nil {
+	reg := a.Roles()
+	if reg == nil {
 		return nil
 	}
-	list := a.roles.List()
+	list := reg.List()
 	out := make([]tools.RoleInfo, 0, len(list))
 	for _, r := range list {
 		out = append(out, tools.RoleInfo{

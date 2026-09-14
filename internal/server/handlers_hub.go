@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -32,8 +31,8 @@ func (s *Server) handleHubSkills(w http.ResponseWriter, r *http.Request) {
 
 	// Mark what is already on disk so the UI can offer the right action.
 	installed := map[string]bool{}
-	if s.skills != nil {
-		for _, sk := range s.skills.List() {
+	if mgr := s.currentSkills(); mgr != nil {
+		for _, sk := range mgr.List() {
 			installed[sk.Name] = true
 		}
 	}
@@ -58,8 +57,8 @@ func (s *Server) handleHubInstallSkill(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	if s.skills != nil {
-		_ = s.skills.Reload()
+	if mgr := s.currentSkills(); mgr != nil {
+		_ = mgr.Reload()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "name": entry.Name, "path": path, "summary": entry.Summary,
@@ -122,6 +121,8 @@ func (s *Server) handleHubMCP(w http.ResponseWriter, r *http.Request) {
 
 // handleHubInstallMCP registers a catalogue server in the configuration.
 func (s *Server) handleHubInstallMCP(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -159,10 +160,8 @@ func (s *Server) handleHubInstallMCP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if s.mcp != nil {
-		// Connecting can take seconds while npx downloads a package; the
-		// request must not wait on it, and neither must its context.
-		go s.mcp.Connect(context.Background(), s.config())
-	}
+	// MCP is reconciled — applyReload (rt.reload) already ran MCP.Refresh
+	// with the desired config, so a duplicate Connect here would build a
+	// second transport and leak the old one.
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "missing_keys": missing})
 }

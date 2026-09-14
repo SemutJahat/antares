@@ -3,7 +3,6 @@ package server
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"sort"
@@ -14,16 +13,19 @@ import (
 	"github.com/enowdev/antares/internal/llm"
 	"github.com/enowdev/antares/internal/providers"
 	"github.com/enowdev/antares/internal/tools"
+	"gopkg.in/yaml.v3"
 )
 
 func configPath() string { return config.ConfigFile() }
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"values":  s.config().Redacted(),
-		"schema":  config.Schema(),
-		"profile": config.ActiveProfile(),
-		"path":    configPath(),
+		"values":           config.Get().Redacted(),
+		"schema":           config.Schema(),
+		"profile":          config.ActiveProfile(),
+		"path":             configPath(),
+		"restart_fields":   s.restartFields(),
+		"restart_required": len(s.restartFields()) > 0,
 	})
 }
 
@@ -33,6 +35,8 @@ func (s *Server) handleConfigSchema(w http.ResponseWriter, r *http.Request) {
 
 // handleUpdateConfig applies dotted-path updates and reloads dependent services.
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -71,11 +75,10 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		// Changing (or clearing) the dashboard password must not leave old
-		// logins valid.
-		if path == "server.dashboard_password_hash" {
-			s.invalidateDashSessions()
-		}
+	}
+	if err := s.validateConfigChange(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
 	}
 	if err := config.Save(cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -85,10 +88,13 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"saved": len(paths), "values": s.config().Redacted()})
+	writeJSON(w, http.StatusOK, map[string]any{"saved": len(paths), "values": config.Get().Redacted(), "restart_fields": s.restartFields(), "restart_required": len(s.restartFields()) > 0})
 }
 
 func (s *Server) handleGetRawConfig(w http.ResponseWriter, r *http.Request) {
+	if s.requireDashboardPassword(w, r) {
+		return
+	}
 	text, err := config.Raw()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -98,6 +104,8 @@ func (s *Server) handleGetRawConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSaveRawConfig(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -105,6 +113,15 @@ func (s *Server) handleSaveRawConfig(w http.ResponseWriter, r *http.Request) {
 		YAML string `json:"yaml"`
 	}
 	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	desired := config.Default()
+	if err := yaml.Unmarshal([]byte(body.YAML), desired); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.validateConfigChange(desired); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -116,13 +133,22 @@ func (s *Server) handleSaveRawConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"saved": true})
+	writeJSON(w, http.StatusOK, map[string]any{"saved": true, "restart_fields": s.restartFields(), "restart_required": len(s.restartFields()) > 0})
 }
 
 // applyReload rebuilds services that depend on configuration.
 func (s *Server) applyReload() error {
+	previousHash := s.config().Server.DashboardPasswordHash
+	defer func() {
+		if s.config().Server.DashboardPasswordHash != previousHash {
+			s.invalidateDashSessions()
+		}
+	}()
 	if s.reloadFn == nil {
-		cfg := config.Get()
+		cfg, _ := config.Effective(s.config(), config.Get())
+		if err := cfg.Validate(); err != nil {
+			return err
+		}
 		s.SetConfig(cfg)
 		s.agent.SetConfig(cfg)
 		if s.gateway != nil {
@@ -133,12 +159,24 @@ func (s *Server) applyReload() error {
 	if err := s.reloadFn(); err != nil {
 		return err
 	}
-	s.SetConfig(config.Get())
-	// The agent owns the rebuilt skill library after a reload.
-	if m := s.agent.Skills(); m != nil {
-		s.skills = m
-	}
+	s.SetConfig(s.agent.Config())
 	return nil
+}
+
+func (s *Server) restartFields() []string {
+	_, fields := config.Effective(s.config(), config.Get())
+	if fields == nil {
+		return []string{}
+	}
+	return fields
+}
+
+func (s *Server) validateConfigChange(desired *config.Config) error {
+	if err := desired.Validate(); err != nil {
+		return err
+	}
+	effective, _ := config.Effective(s.config(), desired)
+	return effective.Validate()
 }
 
 // ---- models -----------------------------------------------------------------
@@ -380,6 +418,8 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleModelSet(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -431,18 +471,14 @@ func (s *Server) handleModelSet(w http.ResponseWriter, r *http.Request) {
 			cfg.ClearInlineModelCredentials()
 		}
 	}
-	// Normalize synchronously BEFORE publishing the pointer to the agent, so the
-	// background save never mutates a struct the agent is concurrently reading
-	// during a live turn. The goroutine then only marshals and writes bytes.
 	config.Normalize(cfg)
-	s.agent.SetConfig(cfg)
-	s.SetConfig(cfg)
-	savePath := config.ConfigFile()
-	go func(c *config.Config, path string) {
-		if err := config.SaveNormalizedAt(path, c); err != nil {
-			slog.Warn("async config save failed after model switch", "error", err)
-		}
-	}(cfg, savePath)
+	if err := config.SaveNormalizedAt(config.ConfigFile(), cfg); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	effective, _ := config.Effective(s.config(), cfg)
+	s.agent.SetConfig(effective)
+	s.SetConfig(effective)
 	writeJSON(w, http.StatusOK, map[string]string{"model": body.Model, "provider": cfg.Model.Provider})
 }
 
@@ -480,6 +516,8 @@ func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleToggleTool(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -515,6 +553,8 @@ func (s *Server) handleToggleTool(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSetToolset(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}

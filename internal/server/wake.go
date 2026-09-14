@@ -132,7 +132,7 @@ func (s *Server) startWakeTurn(session, note string) {
 			ContextInject: note,
 			Platform:      "web",
 		}
-		res, err := s.agent.Run(context.Background(), req, func(e agent.Event) error {
+		res, err := s.agent.RunQueued(context.Background(), req, func(e agent.Event) error {
 			lr.publish(e)
 			return nil
 		})

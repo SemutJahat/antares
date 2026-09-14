@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -82,6 +83,8 @@ func run() error {
 		return cmdStatus(args)
 	case "_serve_foreground":
 		return cmdServeForeground()
+	case "_subagent":
+		return cmdSubAgent(args)
 	case "tui":
 		return cmdTUI()
 	case "config":
@@ -183,7 +186,9 @@ func cmdTUI() error {
 		return fmt.Errorf("preparing workspace: %w", err)
 	}
 
-	return tui.New(rt.agent, rt.cfg, rt.db).Run(ctx)
+	ui := tui.New(rt.agent, rt.cfg, rt.db)
+	ui.SetReload(rt.reload)
+	return ui.Run(ctx)
 }
 
 // runtimeServices bundles everything a running server needs, so a config reload
@@ -526,6 +531,17 @@ func (rt *runtimeServices) reload() error {
 	if err != nil {
 		return err
 	}
+	cfg, _ = config.Effective(rt.cfg, cfg)
+	previous := rt.cfg
+	if err := cfg.Server.ValidateListen(); err != nil {
+		return err
+	}
+	if rt.cron != nil {
+		if err := rt.cron.Reconfigure(cfg.Cron.Enabled, cfg.Cron.Timezone, cfg.Cron.MaxConcurrent, cfg.Cron.HistoryLimit); err != nil {
+			return err
+		}
+	}
+	rt.shell.Reconfigure(cfg.Terminal)
 	rt.cfg = cfg
 	rt.agent.SetConfig(cfg)
 
@@ -562,7 +578,12 @@ func (rt *runtimeServices) reload() error {
 	// The gateway holds its own pointer; without this it would keep reconciling
 	// against the configuration it was constructed with.
 	if rt.gateway != nil {
-		rt.gateway.SetConfig(cfg)
+		if err := rt.gateway.Reconcile(cfg); err != nil {
+			return err
+		}
+	}
+	if rt.mcp != nil && !reflect.DeepEqual(previous.MCP, cfg.MCP) {
+		rt.mcp.Refresh(context.Background(), cfg)
 	}
 
 	slog.Info("configuration reloaded", "model", cfg.Model.Default, "provider", cfg.Model.Provider)
@@ -607,9 +628,10 @@ func cmdServeForeground() error {
 		Social:  rt.social,
 	})
 
-	if rt.cfg.Cron.Enabled {
-		go rt.cron.Start(ctx)
+	if err := rt.cron.Reconfigure(rt.cfg.Cron.Enabled, rt.cfg.Cron.Timezone, rt.cfg.Cron.MaxConcurrent, rt.cfg.Cron.HistoryLimit); err != nil {
+		return err
 	}
+	go rt.cron.Start(ctx)
 	rt.gateway.Start(ctx)
 
 	// Reap idle shells so long-running servers do not leak processes.
@@ -621,7 +643,7 @@ func cmdServeForeground() error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				rt.shell.ReapIdle(time.Duration(rt.cfg.Terminal.LifetimeSeconds) * time.Second)
+				rt.shell.ReapIdle(time.Duration(rt.agent.Config().Terminal.LifetimeSeconds) * time.Second)
 			}
 		}
 	}()

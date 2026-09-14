@@ -4,11 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"runtime"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -121,10 +119,33 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Persist the picked role against the session so a reload reflects it. The
-	// session id is only known once the run assigns one, so a brand-new
-	// conversation stores its role after the session event; an existing one
-	// stores it now.
+	agentReq := agent.Request{
+		SessionID:       req.SessionID,
+		Message:         req.Message,
+		Images:          decodeImages(req.Images),
+		Role:            req.Role,
+		Platform:        "web",
+		UserID:          req.UserID,
+		Model:           req.Model,
+		Toolset:         req.Toolset,
+		ReasoningEffort: req.ReasoningEffort,
+		ProjectDir:      req.ProjectDir,
+		IndexRAG:        req.IndexRAG,
+	}
+	prepared, err := s.agent.Prepare(context.Background(), agentReq)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, agent.ErrSessionBusy) {
+			status = http.StatusConflict
+		}
+		if errors.Is(err, agent.ErrSessionLimit) {
+			status = http.StatusTooManyRequests
+		}
+		writeError(w, status, err)
+		return
+	}
+	req.SessionID = prepared.SessionID()
+	// Admission assigns the id before persistence or streaming begins.
 	if s.db != nil && req.SessionID != "" {
 		if strings.TrimSpace(req.Role) == "" {
 			_ = s.db.DeleteKV(r.Context(), "role:"+req.SessionID)
@@ -135,6 +156,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	sse, err := newSSE(w)
 	if err != nil {
+		prepared.Close()
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -158,20 +180,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	agentReq := agent.Request{
-		SessionID:       req.SessionID,
-		Message:         req.Message,
-		Images:          decodeImages(req.Images),
-		Role:            req.Role,
-		Platform:        "web",
-		UserID:          req.UserID,
-		Model:           req.Model,
-		Toolset:         req.Toolset,
-		ReasoningEffort: req.ReasoningEffort,
-		ProjectDir:      req.ProjectDir,
-		IndexRAG:        req.IndexRAG,
-	}
-
 	// The turn is driven on a background context so it survives this request:
 	// navigating away no longer cancels the model, and a returning client can
 	// reattach through /chat/attach. Events flow into a liveRun; this request is
@@ -182,38 +190,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	sessionKey := req.SessionID
 
 	emit := func(e agent.Event) error {
-		if e.Type == agent.EventSession && e.ID != "" && sessionKey == "" {
-			// Brand-new conversation: register the run under its real id so a
-			// reattach can find it, and remember the picked role.
-			sessionKey = e.ID
-			s.hub.put(e.ID, lr)
-			if strings.TrimSpace(req.Role) != "" && s.db != nil {
-				_ = s.db.SetKV(context.Background(), "role:"+e.ID, req.Role)
-			}
-		}
 		lr.publish(e)
 		return nil // a follower leaving must never fail the run
 	}
 
 	go func() {
 		defer func() {
-			// A panic inside a tool or the agent loop must not take down the
-			// whole server: recover, surface it to the UI as an error event,
-			// and let the deferred finish/remove below run so the liveRun is
-			// not leaked in the hub.
-			if r := recover(); r != nil {
-				slog.Error("chat turn panicked", "session", sessionKey, "panic", r,
-					"stack", string(debug.Stack()))
-				lr.publish(agent.Event{Type: agent.EventError, Err: fmt.Sprintf("internal error: %v", r)})
-				lr.publish(agent.Event{Type: agent.EventDone})
-			}
 			lr.finish()
 			s.hub.remove(sessionKey, lr)
 			// A sub-agent that finished while this turn streamed queued its
 			// result; act on it now as the next turn (context preserved).
 			s.drainAfterTurn(sessionKey)
 		}()
-		if _, err := s.agent.Run(context.Background(), agentReq, emit); err != nil {
+		if _, err := prepared.Run(emit); err != nil {
 			slog.Debug("chat turn failed", "error", err)
 		}
 	}()
@@ -404,6 +393,13 @@ func (s *Server) handleEditMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.db.DeleteMessagesFrom(r.Context(), sessionID, body.MessageID); err != nil {
+		// Not-found means the message id does not belong to this session — the
+		// store now refuses to resolve it against another session and truncate
+		// from an arbitrary offset. Surface it as 404 so the UI can prompt.
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

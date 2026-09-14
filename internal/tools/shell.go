@@ -3,12 +3,14 @@ package tools
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -26,6 +28,10 @@ type ShellManager struct {
 	sessions map[string]*shellSession
 	jobs     map[string]*backgroundProcess
 	cfg      config.Terminal
+	// generation is bumped every time cfg changes. Existing sessions carry the
+	// generation they were built under; a mismatch on session() lookup retires
+	// the stale shell instead of reusing it.
+	generation uint64
 	// sandboxOnce keeps a confinement warning from repeating on every shell.
 	sandboxOnce sync.Once
 	// httpShim, when set, routes curl/wget through the fingerprinted client by
@@ -54,15 +60,21 @@ func (m *ShellManager) EnableHTTPShim(dir, preset, proxy string) {
 }
 
 type shellSession struct {
-	mu       sync.Mutex
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	out      *lockedBuffer
-	done     chan struct{}
-	lastUsed time.Time
-	cwd      string
-	dead     atomic.Bool
-	ps       bool // true when the session shell speaks PowerShell
+	mu         sync.Mutex
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	out        *lockedBuffer
+	done       chan struct{}
+	lastUsed   time.Time
+	cwd        string
+	dead       atomic.Bool
+	ps         bool // true when the session shell speaks PowerShell
+	generation uint64
+	// active is the number of callers that hold a lease on this session:
+	// session() returned it to them and they have not yet released it. Retire
+	// paths refuse to kill a session with a live lease so a not-yet-started
+	// foreground command cannot be terminated between session() and run().
+	active atomic.Int32
 }
 
 // isPowerShellShell reports whether a configured shell is PowerShell (any
@@ -155,25 +167,46 @@ func defaultShell(configured string) (string, []string) {
 	return "/bin/sh", nil
 }
 
-// session returns the live shell for a session id, starting one if needed.
+// ErrShellConfigChanged reports that a persistent shell is still executing a
+// command under the previous terminal configuration. The caller should retry
+// once that command finishes, which lets session() retire the stale shell.
+var ErrShellConfigChanged = errors.New("terminal configuration changed; retry when current command finishes")
+
 func (m *ShellManager) session(id, workspace string) (*shellSession, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[id]; ok && !s.dead.Load() {
-		s.lastUsed = time.Now()
-		return s, nil
+		if s.generation == m.generation {
+			s.lastUsed = time.Now()
+			s.active.Add(1)
+			return s, nil
+		}
+		// Config changed under us. Refuse to touch the shell if it has an
+		// outstanding lease (a caller between session() and run(), or a
+		// concurrent run in progress) or if it is holding its own mutex.
+		// Otherwise retire it and build a fresh one under the new config.
+		if s.active.Load() > 0 || !s.mu.TryLock() {
+			return nil, ErrShellConfigChanged
+		}
+		s.killLocked()
+		s.mu.Unlock()
+		delete(m.sessions, id)
 	}
 
-	shell, shellArgs := defaultShell(m.cfg.Shell)
+	cfg := m.cfg
+	shim := m.httpShim
+	generation := m.generation
+
+	shell, shellArgs := defaultShell(cfg.Shell)
 	var cmd *exec.Cmd
-	switch strings.ToLower(m.cfg.Backend) {
+	switch strings.ToLower(cfg.Backend) {
 	case "docker":
-		image := m.cfg.DockerImage
+		image := cfg.DockerImage
 		if image == "" {
 			image = "debian:bookworm-slim"
 		}
 		net := "none"
-		if m.cfg.AllowNetwork {
+		if cfg.AllowNetwork {
 			net = "bridge"
 		}
 		cmd = exec.Command("docker", "run", "--rm", "-i",
@@ -181,22 +214,22 @@ func (m *ShellManager) session(id, workspace string) (*shellSession, error) {
 			"-v", workspace+":/workspace", "-w", "/workspace",
 			image, "/bin/sh")
 	case "ssh":
-		if m.cfg.SSHHost == "" {
+		if cfg.SSHHost == "" {
 			return nil, fmt.Errorf("terminal.ssh_host is not configured")
 		}
-		cmd = exec.Command("ssh", "-tt", m.cfg.SSHHost, "/bin/sh")
+		cmd = exec.Command("ssh", "-tt", cfg.SSHHost, "/bin/sh")
 	default:
 		// The shell is what gives the agent its reach, so it is what gets
 		// confined. A sandbox that cannot be built is reported once and then
 		// stepped around: refusing to run anything helps nobody.
-		mode, note := sandbox.Resolve(sandbox.Mode(m.cfg.Sandbox))
+		mode, note := sandbox.Resolve(sandbox.Mode(cfg.Sandbox))
 		if note != "" {
 			m.warnSandboxOnce(note)
 		}
 		policy := sandbox.Policy{
 			Workspace:    workspace,
-			AllowNetwork: m.cfg.AllowNetwork,
-			Hidden:       m.hiddenPaths(),
+			AllowNetwork: cfg.AllowNetwork,
+			Hidden:       hiddenPathsFromCfg(cfg),
 		}
 		built, err := sandbox.Command(mode, policy, shell, shellArgs...)
 		if err != nil {
@@ -206,8 +239,8 @@ func (m *ShellManager) session(id, workspace string) (*shellSession, error) {
 		cmd = built
 		cmd.Dir = workspace
 		env := append(os.Environ(), "ANTARES_SESSION="+id, "TERM=dumb", "PAGER=cat", "GIT_PAGER=cat")
-		if m.httpShim.dir != "" {
-			env = withShimEnv(env, m.httpShim)
+		if shim.dir != "" {
+			env = withShimEnv(env, shim)
 		}
 		cmd.Env = env
 	}
@@ -231,8 +264,10 @@ func (m *ShellManager) session(id, workspace string) (*shellSession, error) {
 	s := &shellSession{
 		cmd: cmd, stdin: stdin, out: out, done: make(chan struct{}),
 		lastUsed: time.Now(), cwd: workspace,
-		ps: isPowerShellShell(shell),
+		ps:         isPowerShellShell(shell),
+		generation: generation,
 	}
+	s.active.Add(1)
 	go func() {
 		_ = cmd.Wait()
 		s.dead.Store(true)
@@ -240,6 +275,21 @@ func (m *ShellManager) session(id, workspace string) (*shellSession, error) {
 	}()
 	m.sessions[id] = s
 	return s, nil
+}
+
+// Reconfigure swaps in a new terminal configuration snapshot. Existing
+// foreground commands keep running to completion; the next session() call for
+// a shell whose generation predates the swap retires that shell (if idle) or
+// reports ErrShellConfigChanged (if a command is still running). Unchanged
+// configs are a no-op so a routine reload does not disturb live sessions.
+func (m *ShellManager) Reconfigure(cfg config.Terminal) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if reflect.DeepEqual(m.cfg, cfg) {
+		return
+	}
+	m.cfg = cfg
+	m.generation++
 }
 
 // Close terminates a session's shell.
@@ -297,7 +347,7 @@ func (m *ShellManager) ReapIdle(lifetime time.Duration) {
 	m.mu.Lock()
 	var stale []*shellSession
 	for id, s := range m.sessions {
-		if s.lastUsed.Before(cutoff) {
+		if s.lastUsed.Before(cutoff) && s.active.Load() == 0 {
 			stale = append(stale, s)
 			delete(m.sessions, id)
 		}
@@ -345,6 +395,10 @@ const sentinelPrefix = "__ANTARES_DONE_"
 
 // run executes a command in the persistent shell and waits for the sentinel.
 func (s *shellSession) run(ctx context.Context, command string, timeout time.Duration, onChunk func(string)) (string, int, error) {
+	// Release the session lease held by the session() caller. From here on,
+	// s.mu tracks execution; the lease exists only to protect the gap between
+	// session() returning and this call acquiring s.mu.
+	defer s.active.Add(-1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.dead.Load() {
@@ -691,7 +745,16 @@ func (m *ShellManager) warnSandboxOnce(note string) {
 
 // hiddenPaths resolves the credential directories kept out of the sandbox.
 func (m *ShellManager) hiddenPaths() []string {
-	list := m.cfg.SandboxHidden
+	m.mu.Lock()
+	cfg := m.cfg
+	m.mu.Unlock()
+	return hiddenPathsFromCfg(cfg)
+}
+
+// hiddenPathsFromCfg is the pure-config equivalent of hiddenPaths so callers
+// that already hold m.mu (or a config snapshot) skip the lock.
+func hiddenPathsFromCfg(cfg config.Terminal) []string {
+	list := cfg.SandboxHidden
 	if len(list) == 0 {
 		list = sandbox.DefaultHidden
 	}

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/enowdev/antares/internal/config"
 	"github.com/enowdev/antares/internal/sandbox"
 )
 
@@ -122,7 +123,7 @@ func (m *ShellManager) startBackground(sessionID, workspace, command string, tim
 		return nil, fmt.Errorf("session already has %d running background processes", active)
 	}
 
-	cmd, err := m.backgroundCommand(sessionID, workspace, command)
+	cmd, err := m.buildBackgroundCommand(m.cfg, m.httpShim, sessionID, workspace, command)
 	if err != nil {
 		return nil, err
 	}
@@ -160,31 +161,34 @@ func (m *ShellManager) startBackground(sessionID, workspace, command string, tim
 	return job, nil
 }
 
-func (m *ShellManager) backgroundCommand(sessionID, workspace, command string) (*exec.Cmd, error) {
-	shell, _ := defaultShell(m.cfg.Shell)
-	switch strings.ToLower(m.cfg.Backend) {
+// buildBackgroundCommand constructs a one-shot background exec.Cmd from an
+// already-snapshotted config and shim. It takes no locks so it is safe to
+// invoke from a caller that already holds m.mu.
+func (m *ShellManager) buildBackgroundCommand(cfg config.Terminal, shim httpShimEnv, sessionID, workspace, command string) (*exec.Cmd, error) {
+	shell, _ := defaultShell(cfg.Shell)
+	switch strings.ToLower(cfg.Backend) {
 	case "docker":
-		image := m.cfg.DockerImage
+		image := cfg.DockerImage
 		if image == "" {
 			image = "debian:bookworm-slim"
 		}
 		net := "none"
-		if m.cfg.AllowNetwork {
+		if cfg.AllowNetwork {
 			net = "bridge"
 		}
 		return exec.Command("docker", "run", "--rm", "-i", "--network", net,
 			"-v", workspace+":/workspace", "-w", "/workspace", image, "/bin/sh", "-c", command), nil
 	case "ssh":
-		if m.cfg.SSHHost == "" {
+		if cfg.SSHHost == "" {
 			return nil, fmt.Errorf("terminal.ssh_host is not configured")
 		}
-		return exec.Command("ssh", "-T", m.cfg.SSHHost, "/bin/sh -c "+shellQuote(command)), nil
+		return exec.Command("ssh", "-T", cfg.SSHHost, "/bin/sh -c "+shellQuote(command)), nil
 	default:
-		mode, note := sandbox.Resolve(sandbox.Mode(m.cfg.Sandbox))
+		mode, note := sandbox.Resolve(sandbox.Mode(cfg.Sandbox))
 		if note != "" {
 			m.warnSandboxOnce(note)
 		}
-		policy := sandbox.Policy{Workspace: workspace, AllowNetwork: m.cfg.AllowNetwork, Hidden: m.hiddenPaths()}
+		policy := sandbox.Policy{Workspace: workspace, AllowNetwork: cfg.AllowNetwork, Hidden: hiddenPathsFromCfg(cfg)}
 		cmd, err := sandbox.Command(mode, policy, shell, "-c", command)
 		if err != nil {
 			m.warnSandboxOnce(err.Error())
@@ -192,8 +196,8 @@ func (m *ShellManager) backgroundCommand(sessionID, workspace, command string) (
 		}
 		cmd.Dir = workspace
 		env := append(os.Environ(), "ANTARES_SESSION="+sessionID, "TERM=dumb", "PAGER=cat", "GIT_PAGER=cat")
-		if m.httpShim.dir != "" {
-			env = withShimEnv(env, m.httpShim)
+		if shim.dir != "" {
+			env = withShimEnv(env, shim)
 		}
 		cmd.Env = env
 		return cmd, nil

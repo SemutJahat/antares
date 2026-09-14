@@ -80,6 +80,23 @@ func requestIsLoopback(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// requestIsSameOriginBrowser reports whether a browser-issued request is
+// safe to treat as originating from the dashboard itself. It closes the CSRF
+// hole that requestIsLoopback alone would leave open: a page on any origin
+// running inside the operator's browser is loopback, but its cross-origin
+// simple requests carry `Sec-Fetch-Site: cross-site`. Non-browser callers
+// (curl, the CLI, scripts) simply do not set the header, and their loopback
+// or bearer credential is already enough — they must not be blocked here.
+func requestIsSameOriginBrowser(r *http.Request) bool {
+	site := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")))
+	if site == "" {
+		// Not a Fetch-Metadata-capable browser: fall back to the caller's
+		// existing check (loopback / bearer). This preserves scripted access.
+		return true
+	}
+	return site == "same-origin" || site == "none"
+}
+
 // requireSetupAccess keeps the first-run mutating endpoints local unless the
 // operator has already configured a bearer token. Setup status remains a
 // read-only endpoint so the UI can explain how to bootstrap an instance.
@@ -89,10 +106,18 @@ func (s *Server) requireSetupAccess(w http.ResponseWriter, r *http.Request) bool
 		writeError(w, http.StatusConflict, errors.New("initial setup has already been completed"))
 		return true
 	}
-	if requestIsLoopback(r) || s.bearerAuthorized(r) {
+	// Bearer credential is a scripted/CLI caller — trust it as-is.
+	if s.bearerAuthorized(r) {
 		return false
 	}
-	writeError(w, http.StatusForbidden, errors.New("initial setup is available only from loopback or with a configured bearer token"))
+	// Loopback alone is not enough: a page on any origin running in the
+	// operator's browser is loopback, so the caller must additionally look
+	// like a same-origin fetch (or a non-browser client that does not send
+	// Fetch-Metadata at all).
+	if requestIsLoopback(r) && requestIsSameOriginBrowser(r) {
+		return false
+	}
+	writeError(w, http.StatusForbidden, errors.New("initial setup is available only from a same-origin loopback client or with a configured bearer token"))
 	return true
 }
 

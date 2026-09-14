@@ -271,11 +271,25 @@ func (s *sqlStore) DeleteMessage(ctx context.Context, id string) error {
 // in the session (by seq), then recomputes the session's message/token tallies
 // from what remains. Used by "edit message", which drops the edited turn and all
 // that followed so the conversation can be re-sent from that point.
+//
+// The seq lookup is scoped to the caller's sessionID so a fromID that belongs
+// to a different session cannot be resolved against the whole `messages` table
+// and cross-truncate the target session from an arbitrary offset. When the id
+// is absent from this session, ErrNotFound is returned and no rows are touched.
 func (s *sqlStore) DeleteMessagesFrom(ctx context.Context, sessionID, fromID string) error {
-	_, err := s.exec(ctx,
-		`DELETE FROM messages WHERE session_id=? AND seq >= (SELECT seq FROM messages WHERE id=?)`,
-		sessionID, fromID)
+	var seq int64
+	err := s.row(ctx,
+		`SELECT seq FROM messages WHERE id=? AND session_id=?`,
+		fromID, sessionID).Scan(&seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
 	if err != nil {
+		return err
+	}
+	if _, err := s.exec(ctx,
+		`DELETE FROM messages WHERE session_id=? AND seq >= ?`,
+		sessionID, seq); err != nil {
 		return err
 	}
 	// Keep the owned counters honest (see session-counter ownership).

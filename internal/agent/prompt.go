@@ -20,6 +20,11 @@ import (
 // buildSystemPrompt assembles identity, environment, memory, and tool guidance.
 func (a *Agent) buildSystemPrompt(ctx context.Context, req Request, sess *store.Session, active []tools.Tool) string {
 	cfg := a.config()
+	// Snapshot the live-replaceable services once, so a mid-prompt reload
+	// (SetRAG / SetSkills) cannot leave the nil check disagreeing with the
+	// use below.
+	ragProvider := a.RAG()
+	skillsMgr := a.Skills()
 	var b strings.Builder
 
 	b.WriteString("You are ")
@@ -34,7 +39,7 @@ func (a *Agent) buildSystemPrompt(ctx context.Context, req Request, sess *store.
 	b.WriteString("## Who you are\n\n")
 	b.WriteString(soul)
 	b.WriteString("\n")
-	if config.SoulIsUnset() && req.Platform != "subagent" {
+	if config.SoulIsUnset() && !isSubordinateRun(req) {
 		b.WriteString(`
 You have not been given an identity yet. Before anything else this conversation,
 introduce yourself warmly and briefly — you have just "woken up" here and are
@@ -59,6 +64,23 @@ help them now — do not block them.
 - Be concise. Skip preamble and restating the question; lead with the answer or the result.
 - Match the user's language. If they write Indonesian, answer in Indonesian.
 `)
+
+	// A subordinate run has no user watching. If it stalls on a clarification
+	// the parent stalls too. State the rule plainly so no amount of "just to
+	// be safe" tugs it back to asking.
+	if isSubordinateRun(req) {
+		b.WriteString(`
+## You are an autonomous subordinate
+
+You are running as a worker for another agent. Nobody is watching your stream.
+
+- ask_user is not available and any attempt to call it will be refused.
+- Do not wait for clarification or confirmation — no one will answer.
+- Make the most reasonable assumption a competent professional would make, act on it, and state the assumption plainly in your final reply.
+- If you truly cannot proceed, end with a short STATEMENT to the parent: what you were asked, what is blocking, what you tried, what the parent needs to decide. Phrase it as a report, not a question you are waiting on.
+- Finish the task end to end in this run. Your final message IS the handoff.
+`)
+	}
 
 	// A standing goal is the whole frame for the turn, so it goes near the top.
 	if g, ok := a.GetGoal(ctx, sess.ID); ok && !g.Done && !g.Paused {
@@ -117,7 +139,7 @@ help them now — do not block them.
 		if hasTool(active, "memory") && cfg.Memory.Enabled {
 			b.WriteString("- Save durable facts about the user or project with the memory tool. Save only what stays true across sessions.\n")
 		}
-		if hasTool(active, "rag_search") && a.rag != nil {
+		if hasTool(active, "rag_search") && ragProvider != nil {
 			b.WriteString("- Before reading many files, try rag_search to locate the relevant passages first.\n")
 		}
 		if hasTool(active, "delegate_task") && cfg.Delegation.Enabled {
@@ -147,8 +169,8 @@ help them now — do not block them.
 		}
 	}
 
-	if a.skills != nil && cfg.Skills.Enabled {
-		if catalogue := a.skills.PromptBlock(60); catalogue != "" {
+	if skillsMgr != nil && cfg.Skills.Enabled {
+		if catalogue := skillsMgr.PromptBlock(60); catalogue != "" {
 			b.WriteString("\n## Your skills\n\n")
 			b.WriteString("Procedures you have learned. Read one with the skill tool before following it.\n\n")
 			b.WriteString(catalogue)
@@ -398,9 +420,35 @@ func hasTool(list []tools.Tool, name string) bool {
 	return false
 }
 
+// isSubordinateRun reports whether this run is an in-process worker of some
+// parent — a delegated sub-agent, a background task, or a continued sub-session
+// resumed via the task tool. Such a run has no user watching, so blocking on
+// the ask desk would silently deadlock the parent. Depth>0 catches nested
+// delegation regardless of the platform label; the platform check catches the
+// first hop (Depth is set to 1 by the parent, but sub-sessions that a
+// continueTask reuses can also be reached via callers who forget to bump
+// Depth). Quiet alone is NOT sufficient: internal one-shot classifiers (the
+// relevance gate in cmd/antares) also set Quiet, and they are top-level runs
+// that should keep normal ask semantics if they ever add ask_user to their
+// toolset.
+func isSubordinateRun(req Request) bool {
+	if req.Depth > 0 {
+		return true
+	}
+	switch req.Platform {
+	case "subagent", "background":
+		return true
+	}
+	return false
+}
+
 // resolveTools picks the tool set for this run, honouring platform overrides.
 func (a *Agent) resolveTools(req Request) []tools.Tool {
 	cfg := a.config()
+	// Snapshot the live-replaceable services once, so a mid-resolve reload
+	// cannot leave the availability check disagreeing between iterations.
+	ragProvider := a.RAG()
+	skillsMgr := a.Skills()
 	toolset := req.Toolset
 	if toolset == "" {
 		if v, ok := cfg.Tools.Platform[req.Platform]; ok && v != "" {
@@ -419,7 +467,7 @@ func (a *Agent) resolveTools(req Request) []tools.Tool {
 	for _, t := range selected {
 		switch t.Name() {
 		case "rag_search", "rag_index":
-			if a.rag == nil {
+			if ragProvider == nil {
 				continue
 			}
 		case "memory":
@@ -435,7 +483,15 @@ func (a *Agent) resolveTools(req Request) []tools.Tool {
 				continue
 			}
 		case "skill":
-			if a.skills == nil || !cfg.Skills.Enabled {
+			if skillsMgr == nil || !cfg.Skills.Enabled {
+				continue
+			}
+		case "ask_user":
+			// A worker (delegated sub-agent, background task, continued
+			// sub-session) has no user watching its stream, so exposing
+			// ask_user would let it block on the ask desk forever while
+			// the parent waits for its answer. Force it to decide.
+			if isSubordinateRun(req) {
 				continue
 			}
 		}

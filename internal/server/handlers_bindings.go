@@ -85,6 +85,8 @@ func (s *Server) handleChannelCommands(w http.ResponseWriter, r *http.Request) {
 // Discord distinguishes styles ("plain" vs "embed"); the value is written to
 // config and the gateway reconnects so it takes effect at once.
 func (s *Server) handleSetChannelStyle(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	id := strings.ToLower(r.PathValue("id"))
 	var body struct {
 		Style string `json:"style"`
@@ -147,6 +149,8 @@ func (s *Server) handleListBindings(w http.ResponseWriter, r *http.Request) {
 // existing id is replaced; one without gets a fresh id. The gateway needs no
 // reconnect — routing is resolved per message from the live config.
 func (s *Server) handleSaveBinding(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	var b config.Binding
 	if err := decodeBody(r, &b); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -201,6 +205,8 @@ func (s *Server) handleSaveBinding(w http.ResponseWriter, r *http.Request) {
 
 // handleDeleteBinding removes one routing binding by id.
 func (s *Server) handleDeleteBinding(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	id := r.PathValue("id")
 	cfg, err := config.Reload()
 	if err != nil {

@@ -107,9 +107,9 @@ func hubMCPInstall(ctx context.Context, d Deps, id string) (Result, error) {
 	if err := d.reload(); err != nil {
 		return Result{}, err
 	}
-	if d.MCP != nil {
-		go d.MCP.Connect(context.Background(), config.Get())
-	}
+	// MCP is reconciled — d.reload (rt.reload) already refreshed the active
+	// servers from the desired config, so a second Connect here would build
+	// duplicate transports.
 
 	entry, _ := hub.LookupMCP(id)
 	out := fmt.Sprintf("Added **%s**.", entry.Name)

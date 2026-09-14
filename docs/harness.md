@@ -26,7 +26,10 @@ agent:
   repeat_limit: 3     # identical calls tolerated before the nudge
 ```
 
-Different arguments are not repetition. Reading twenty files in a row is fine.
+Different arguments are not repetition. Reading twenty files in a row is
+fine. `write_file` and `edit_file` are the exception — they fingerprint by
+target path rather than full arguments, so a model retrying the same file
+with slightly different content is still caught as one stuck call.
 
 ## Steering
 

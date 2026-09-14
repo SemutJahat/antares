@@ -72,9 +72,12 @@ func (a skillAdapter) Write(name, description, body string, tags []string) error
 func (a skillAdapter) MarkUsed(name string) { a.m.MarkUsed(name) }
 
 // skillLibrary exposes the manager to tools, or nil when skills are off.
+// The manager is snapshotted once so a concurrent SetSkills cannot leave the
+// returned adapter pointing at a stale (or nil) library.
 func (a *Agent) skillLibrary() tools.SkillLibrary {
-	if a.skills == nil || !a.config().Skills.Enabled {
+	m := a.Skills()
+	if m == nil || !a.config().Skills.Enabled {
 		return nil
 	}
-	return skillAdapter{m: a.skills}
+	return skillAdapter{m: m}
 }

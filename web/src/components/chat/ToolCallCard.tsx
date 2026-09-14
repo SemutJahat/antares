@@ -16,7 +16,7 @@ import {
   Wrench,
 } from '@phosphor-icons/react'
 import { cn } from '@/lib/utils'
-import type { ToolCallView } from '@/pages/ChatPage'
+import type { ToolCallView } from '@/lib/chatTranscript'
 import { useI18n } from '@/lib/i18n'
 
 type IconType = React.ComponentType<{ className?: string; weight?: 'regular' | 'fill' }>

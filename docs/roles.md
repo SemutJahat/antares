@@ -171,6 +171,10 @@ The primary agent hands a self-contained piece of work to a specialist with
 its own instructions and tools, and returns only its final answer — research
 that would flood the main conversation happens elsewhere.
 
+A sub-agent is autonomous within that workstream. It cannot call `ask_user` or
+wait for clarification; it makes a reasonable assumption and reports it, or
+returns a blocker statement to the parent agent.
+
 For work on a git repository, pass `isolate`: the sub-agent gets its own git
 worktree off the current HEAD. Several sub-agents can then edit the same
 repository in parallel without conflicting — each has a private working

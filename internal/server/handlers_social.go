@@ -78,16 +78,16 @@ func (s *Server) handleSocialStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled":           cfg.Social.Enabled,
-		"encryption_ready":  encryptionReady,
-		"imap_configured":   imapConfigured,
-		"imap_host":         cfg.Social.IMAPHost,
-		"imap_port":         cfg.Social.IMAPPort,
-		"imap_username":     cfg.Social.IMAPUsername,
+		"enabled":          cfg.Social.Enabled,
+		"encryption_ready": encryptionReady,
+		"imap_configured":  imapConfigured,
+		"imap_host":        cfg.Social.IMAPHost,
+		"imap_port":        cfg.Social.IMAPPort,
+		"imap_username":    cfg.Social.IMAPUsername,
 		"browser": map[string]any{
-			"enabled":  cfg.Social.BrowserEnabled,
-			"state":    browserState,
-			"error":    browserErr,
+			"enabled": cfg.Social.BrowserEnabled,
+			"state":   browserState,
+			"error":   browserErr,
 		},
 		"autopilot_enabled": cfg.Social.AutopilotEnabled,
 		"accounts":          accounts,
@@ -137,6 +137,8 @@ func (s *Server) handleSocialIMAPTest(w http.ResponseWriter, r *http.Request) {
 // handleSocialIMAPSave persists IMAP settings. The password is encrypted
 // via the social master key and stored in KV.
 func (s *Server) handleSocialIMAPSave(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -174,8 +176,14 @@ func (s *Server) handleSocialIMAPSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Store non-secret settings in config and secret in KV.
-	cfg := s.config()
+	// Reload gives us a clone we own outright — mutating the live shared
+	// pointer would race the agent and clobber any pending restart-required
+	// fields still queued on disk.
+	cfg, err := config.Reload()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	host := strings.TrimSpace(body.Host)
 	if host == "" {
 		host = "imap.gmail.com"
@@ -192,6 +200,10 @@ func (s *Server) handleSocialIMAPSave(w http.ResponseWriter, r *http.Request) {
 	// Persist config to YAML so it survives restarts.
 	if err := config.Save(cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("cannot save config: "+err.Error()))
+		return
+	}
+	if err := s.applyReload(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
@@ -251,6 +263,8 @@ func (s *Server) handleSocialBrowserOpen(w http.ResponseWriter, r *http.Request)
 
 // handleSocialAutopilot toggles the social media autopilot.
 func (s *Server) handleSocialAutopilot(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}
@@ -261,10 +275,18 @@ func (s *Server) handleSocialAutopilot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	cfg := s.config()
+	cfg, err := config.Reload()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	_ = cfg.SetPath("social.autopilot_enabled", body.Enabled)
 	if err := config.Save(cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("cannot save config: "+err.Error()))
+		return
+	}
+	if err := s.applyReload(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": body.Enabled})

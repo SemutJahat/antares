@@ -21,8 +21,17 @@ Nothing here needs root.
 | `bubblewrap` | **read-only except the workspace, credentials hidden** | gone unless allowed | `bwrap` installed |
 | `auto` | the strongest of the above that works here | | — |
 
-`auto` is the setting to use. It picks bubblewrap when installed, falls back to
-namespaces, and says which it got — once, in the log, not on every command.
+`auto` is the new-install default. It picks bubblewrap when installed, falls back
+to namespaces, and logs the fallback once. `allow_network` remains enabled by
+default; the example above explicitly disables it.
+
+On macOS and Windows there is no in-process mechanism to build a bubblewrap
+or user-namespace jail from an unprivileged Go process, so `auto` degrades
+to `none` and logs why. Confinement on those platforms comes from the
+deployment: run the shell tool with `terminal.backend: docker` and mount
+only the workspace, put the whole binary in a VM, or point the shell at a
+dedicated SSH host — those are the strong-separation options, and each is
+documented below.
 
 ## Namespaces
 

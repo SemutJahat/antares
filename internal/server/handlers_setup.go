@@ -311,6 +311,8 @@ func (s *Server) handleSetupTest(w http.ResponseWriter, r *http.Request) {
 
 // handleSetupComplete writes everything the wizard collected in one save.
 func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	s.setupMu.Lock()
 	defer s.setupMu.Unlock()
 	if s.requireSetupAccess(w, r) {
@@ -515,6 +517,8 @@ func (s *Server) verifyCursorProvider(
 // It exists because config.SetPath cannot write into the providers map: map
 // values are not addressable through reflection.
 func (s *Server) handleSetProviderKey(w http.ResponseWriter, r *http.Request) {
+	s.configWriteMu.Lock()
+	defer s.configWriteMu.Unlock()
 	if s.requireDashboardPassword(w, r) {
 		return
 	}

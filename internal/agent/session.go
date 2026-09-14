@@ -30,7 +30,7 @@ func (a *Agent) resolveSession(ctx context.Context, req *Request) (*store.Sessio
 		platform = "web"
 	}
 	sess := &store.Session{
-		ID:        newID("ses"),
+		ID:        req.SessionID,
 		Title:     defaultTitle(req.Message),
 		Platform:  platform,
 		ChannelID: req.ChannelID,
@@ -39,6 +39,9 @@ func (a *Agent) resolveSession(ctx context.Context, req *Request) (*store.Sessio
 		Provider:  a.config().Model.Provider,
 		Workspace: firstNonEmpty(req.Workspace, a.config().Agent.Workspace),
 		Meta:      store.Meta{},
+	}
+	if sess.ID == "" {
+		sess.ID = newID("ses")
 	}
 	// A project session binds to a chosen folder: the workspace becomes the
 	// project (so the terminal, reads, and relative paths all centre on it), and
@@ -116,6 +119,11 @@ func (a *Agent) loadHistory(ctx context.Context, sess *store.Session, req Reques
 	visible := make([]store.Message, 0, len(rows))
 	for _, r := range rows {
 		if r.Hidden || r.Compacted {
+			continue
+		}
+		// A persisted failure is transcript furniture for the person reading it,
+		// not something the model should read back as its own words.
+		if isPersistedTurnError(r) {
 			continue
 		}
 		visible = append(visible, r)

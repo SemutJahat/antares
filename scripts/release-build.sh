@@ -53,6 +53,7 @@ info "building the dashboard"
 ( cd web && $BUN install && $BUN run build )
 rm -rf internal/server/dist
 cp -r web/dist internal/server/dist
+touch internal/server/dist/.gitkeep
 
 rm -rf "$OUT"
 mkdir -p "$OUT"

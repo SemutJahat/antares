@@ -93,6 +93,11 @@ type Model struct {
 	welcomeFrame int // animation frame for the empty-state splash
 
 	demo bool
+
+	// reload rebuilds runtime-owned services (shell, RAG, skills, plugins,
+	// roles, gateway, MCP) from the on-disk desired config. Wired by the
+	// runtime via SetReload; nil in the demo and in tests.
+	reload func() error
 }
 
 // New builds a TUI bound to a running agent.
@@ -131,6 +136,13 @@ func New(ag *agent.Agent, cfg *config.Config, db store.Store) *Model {
 		showReasoning: cfg != nil && cfg.Display.ShowReasoning,
 	}
 }
+
+// SetReload wires the runtime's reload closure so config changes made from
+// the TUI (model switch, provider connect, theme, /config …) rebuild the
+// same services a dashboard save would. Call once after New; nil is fine
+// (the TUI falls back to a config-only refresh and notes what a restart
+// would apply).
+func (m *Model) SetReload(fn func() error) { m.reload = fn }
 
 // Run takes over the terminal until the user quits.
 func (m *Model) Run(ctx context.Context) error {
@@ -488,29 +500,67 @@ func (m *Model) persistTheme(name string) {
 
 // reloadConfig re-reads config from disk so the TUI reflects changes made
 // elsewhere (the dashboard, the CLI, a hand-edited file) without a restart.
-// Preserves the live theme, which is applied but only persisted on change.
+// When SetReload is wired, delegate to the runtime so the same services a
+// dashboard save rebuilds (shell, RAG, skills, plugins, roles, gateway,
+// reconciled MCP) come up on the desired config. The agent gets a distinct
+// pointer either way, so a subsequent TUI mutation of m.cfg cannot race the
+// running services.
 func (m *Model) reloadConfig() {
 	if m.ag == nil {
 		return // no live runtime (tests / demo) — keep the in-memory config
+	}
+	if m.reload != nil {
+		if err := m.reload(); err != nil {
+			m.setStatus("reload failed: " + err.Error())
+			return
+		}
+		// After rt.reload the desired config is on disk and the agent holds
+		// the effective view; hand the TUI its own desired clone.
+		m.cfg = config.Get()
+		return
 	}
 	fresh, err := config.Reload()
 	if err != nil || fresh == nil {
 		return
 	}
 	m.cfg = fresh
-	m.ag.SetConfig(fresh)
+	// Hand the agent an effective clone so it keeps its boot-time
+	// restart-required values; a later TUI mutation of m.cfg must not race
+	// the running services.
+	effective, _ := config.Effective(m.ag.Config(), fresh)
+	m.ag.SetConfig(effective)
 }
 
-// saveConfig applies the config to the running agent and writes it to disk.
+// saveConfig writes the desired config to disk, then rebuilds runtime
+// services. When SetReload is wired the runtime owns the whole reconcile
+// (shell, RAG, skills, plugins, roles, gateway, reconciled MCP) — reloading
+// picks up the just-saved desired. Without SetReload we fall back to handing
+// the agent an effective clone so restart-required fields survive; the user
+// sees which ones needed a restart to fully apply.
 func (m *Model) saveConfig() {
 	if m.cfg == nil {
 		return
 	}
-	if m.ag != nil {
-		m.ag.SetConfig(m.cfg)
-	}
 	if err := config.Save(m.cfg); err != nil {
 		m.setStatus("save failed: " + err.Error())
+		return
+	}
+	if m.reload != nil {
+		if err := m.reload(); err != nil {
+			m.setStatus("reload failed: " + err.Error())
+			return
+		}
+		// Keep m.cfg as the desired clone so the next mutation edits a
+		// TUI-owned pointer, not the agent's live view.
+		m.cfg = config.Get()
+		return
+	}
+	if m.ag != nil {
+		effective, pending := config.Effective(m.ag.Config(), m.cfg)
+		m.ag.SetConfig(effective)
+		if len(pending) > 0 {
+			m.setStatus("saved; restart to apply: " + strings.Join(pending, ", "))
+		}
 	}
 }
 

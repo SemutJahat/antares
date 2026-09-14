@@ -13,16 +13,18 @@ const SetupPage = lazy(() => import('@/pages/SetupPage'))
 const LoginPage = lazy(() => import('@/pages/LoginPage'))
 
 // Dev-only UI prototypes live under src/sample/ (gitignored, never shipped).
-// The glob resolves to nothing on a clean checkout, so /sample simply 404s to
-// "/" there; when the folder exists, each sample/<name>.tsx mounts at
-// /sample/<name>. import.meta.glob is compile-time, so a missing folder is not
-// an error — this file stays committable with no hard dependency on it.
-const sampleModules = import.meta.glob('./sample/*.tsx')
-const sampleRoutes = Object.entries(sampleModules).map(([path, loader]) => {
-  const name = path.replace('./sample/', '').replace('.tsx', '')
-  const Comp = lazy(loader as () => Promise<{ default: React.ComponentType }>)
-  return { name, Comp }
-})
+// The glob is guarded by import.meta.env.DEV so production bundles never even
+// see the folder — Vite tree-shakes the branch out and the prototypes stay
+// out of the shipped app. In dev, each sample/<name>.tsx mounts standalone at
+// /sample/<name>; on a clean checkout the glob resolves to nothing and
+// /sample simply 404s to "/".
+const sampleRoutes = import.meta.env.DEV
+  ? Object.entries(import.meta.glob('./sample/*.tsx')).map(([path, loader]) => {
+      const name = path.replace('./sample/', '').replace('.tsx', '')
+      const Comp = lazy(loader as () => Promise<{ default: React.ComponentType }>)
+      return { name, Comp }
+    })
+  : []
 
 export function App() {
   return (

@@ -27,7 +27,7 @@ var (
 func Load() (*Config, error) {
 	mu.RLock()
 	if loaded != nil {
-		c := loaded
+		c := loaded.Clone()
 		mu.RUnlock()
 		return c, nil
 	}
@@ -60,7 +60,7 @@ func Reload() (*Config, error) {
 	normalize(cfg)
 
 	mu.Lock()
-	loaded = cfg
+	loaded = cfg.Clone()
 	mu.Unlock()
 	return cfg, nil
 }
@@ -89,7 +89,7 @@ func SaveNormalizedAt(path string, cfg *Config) error {
 		return err
 	}
 	mu.Lock()
-	loaded = cfg
+	loaded = cfg.Clone()
 	mu.Unlock()
 	return nil
 }
@@ -113,10 +113,7 @@ func SaveRaw(text string) error {
 	if err := yaml.Unmarshal([]byte(text), cfg); err != nil {
 		return fmt.Errorf("invalid YAML: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(ConfigFile()), 0o700); err != nil {
-		return err
-	}
-	if err := os.WriteFile(ConfigFile(), []byte(text), 0o600); err != nil {
+	if err := writeBytes(ConfigFile(), []byte(text)); err != nil {
 		return err
 	}
 	_, err := Reload()
@@ -124,15 +121,19 @@ func SaveRaw(text string) error {
 }
 
 func writeFile(path string, cfg *Config) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
 	out, err := yaml.Marshal(cfg)
 	if err != nil {
 		return err
 	}
 	header := "# Antares configuration\n# Docs: https://github.com/enowdev/antares\n"
+	return writeBytes(path, append([]byte(header), out...))
+}
+
+func writeBytes(path string, out []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
 
 	// Serialise writes so two concurrent saves cannot interleave, and use a
 	// unique temp file so a rename can never pick up another writer's partial
@@ -148,7 +149,7 @@ func writeFile(path string, cfg *Config) error {
 	// Best-effort cleanup if we fail before the rename.
 	defer func() { _ = os.Remove(tmpName) }()
 
-	if _, err := tmp.Write(append([]byte(header), out...)); err != nil {
+	if _, err := tmp.Write(out); err != nil {
 		_ = tmp.Close()
 		return err
 	}
@@ -294,6 +295,12 @@ func normalize(c *Config) {
 	}
 	for i, d := range c.Skills.Dirs {
 		c.Skills.Dirs[i] = Expand(d)
+	}
+	if strings.TrimSpace(c.Server.Host) == "" {
+		c.Server.Host = "127.0.0.1"
+	}
+	if c.MaxConcurrentSessions < 0 {
+		c.MaxConcurrentSessions = 4
 	}
 	if c.Server.Port <= 0 {
 		c.Server.Port = 8787

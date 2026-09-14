@@ -134,7 +134,9 @@ func (a *Agent) persistContextCompact(ctx context.Context, sess *store.Session, 
 	}
 	visible := make([]store.Message, 0, len(rows))
 	for _, r := range rows {
-		if r.Hidden {
+		// Mirror loadHistory: hidden rows and persisted failures are not part of
+		// the model-facing history, so they must not shift the compact boundary.
+		if r.Hidden || isPersistedTurnError(r) {
 			continue
 		}
 		visible = append(visible, r)

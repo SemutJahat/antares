@@ -146,19 +146,22 @@ Both schemas are created on first run. SQLite searches conversations with FTS5,
 Postgres with `tsvector`. `memory` keeps everything in RAM and is for tests.
 
 ## Tools
-
 ```yaml
 tools:
-  toolset: default          # minimal | coding | research | browser | default | all
+  toolset: coding           # minimal | coding | research | browser | default | all
   enabled: []               # add to the toolset
   disabled: []              # remove from it
-  approval_mode: auto       # auto | prompt | deny
-  max_output_chars: 30000
+  approval_mode: prompt     # auto | prompt | deny
+  max_output_chars: 60000
   timeouts:
-    terminal: 120
+    terminal: 300
 ```
 
-See [Tools](tools.md) for what is in each toolset.
+The shipped defaults are `toolset: coding` (a file/edit/shell/browser
+working set) and `approval_mode: prompt` (mutating tools ask first). Set
+`auto` for unattended runs, `deny` to refuse mutations outright, or a
+narrower `toolset` such as `research` to drop the shell entirely. See
+[Tools](tools.md) for what is in each toolset.
 
 **Web search:**
 
@@ -266,16 +269,22 @@ override a shared one. See [Skills](skills.md).
 
 ```yaml
 server:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8787
-  auth_token: ""            # empty leaves the dashboard open
+  auth_token: ""            # empty leaves the dashboard open on loopback
+  auth_disabled: false      # explicit opt-out for public unauthenticated binds
   cors_origins: []
   public_url: ""
   trust_proxy: false
 ```
 
-Set `auth_token` for anything reachable beyond a private network. Set
-`public_url` when behind a reverse proxy so generated links are right.
+The default `127.0.0.1` binding leaves the dashboard open, which is right
+behind a private network. A non-loopback `host` refuses to start unless one
+of these is true: `auth_token` is set, a dashboard password has been
+configured, or `auth_disabled: true` is set explicitly — the last is the
+documented opt-out for the rare case you really want a public
+unauthenticated bind. Set `public_url` when behind a reverse proxy so
+generated links are right.
 
 ## Scheduling, channels, MCP
 
@@ -301,6 +310,35 @@ mcp:
 ```
 
 See [Scheduling](scheduling.md), [Channels](channels.md), and [MCP](mcp.md).
+
+## Persisted vs. effective configuration
+
+The YAML file is authoritative on disk: every write from the dashboard,
+`antares config set`, or a `/config` command normalises the struct and
+writes it back through `config.Save`; the raw-editor endpoint validates
+then replaces the file via `config.SaveRaw`. What the running process
+actually uses is a separate view. `config.Effective(current, desired)`
+takes the on-disk configuration and, for every field classified as
+`restart_required`, keeps the running value — the desired value stays on
+disk and takes effect at the next restart, and the affected paths surface
+as a "pending restart" banner on the dashboard.
+
+`config.ReloadMode(path)` is the single classifier:
+
+| Class | Behaviour | Paths |
+|---|---|---|
+| `restart_required` | Kept from the boot config until the next restart | `database.*`, `logging.*`, `social.*`, `tools.browser.*`, `tools.http.*`, `server.host`, `server.port` |
+| `reconciled` | Applied by asking the owning subsystem to rebuild from the new value | `terminal.*`, `cron.*`, `gateway.*`, `mcp.*`, `rag.*`, `plugins.*`, `roles.*`, `skills.dirs` |
+| `live` | Read on every use; the write takes effect immediately | everything else (model, agent, memory, compression, prompt caching, most of `tools.*`) |
+
+Reconciled subsystems own long-lived state that cannot be swapped out
+mid-request — terminal shell lifetimes, cron schedules, MCP transports,
+RAG indexes, plugin/role/skill scanners, gateway connections — so a save
+triggers a targeted re-application rather than a process bounce. The
+dashboard's Settings page reads each field's `Reload` label from
+`config.Schema()` and shows it next to the field, so you can tell before
+saving whether the change is live, will be reconciled, or requires a
+restart.
 
 ## Environment overrides
 

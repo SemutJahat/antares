@@ -84,16 +84,26 @@ func (p *builtinProvider) Index(ctx context.Context, collection string, docs []t
 		chunk store.Chunk
 		text  string
 	}
-	var queue []pending
+	// Group by doc so a re-embed that shrinks below its previous length is
+	// pruned by ReplaceDocuments' tail-delete. A doc that chunks down to
+	// zero parts (empty content after normalization) is handled by
+	// DeleteDocuments — otherwise the previous version's chunks would
+	// silently survive the re-index.
+	perDoc := make(map[string][]pending, len(docs))
+	order := make([]string, 0, len(docs))
 
 	for _, d := range docs {
+		if _, seen := perDoc[d.ID]; !seen {
+			order = append(order, d.ID)
+			perDoc[d.ID] = nil
+		}
 		parts := chunkText(d.Content, p.cfg.RAG.ChunkSize, p.cfg.RAG.ChunkOverlap)
 		for i, part := range parts {
 			meta := store.Meta{}
 			for k, v := range d.Meta {
 				meta[k] = v
 			}
-			queue = append(queue, pending{
+			perDoc[d.ID] = append(perDoc[d.ID], pending{
 				chunk: store.Chunk{
 					ID:         chunkID(collection, d.ID, i),
 					Collection: collection,
@@ -107,37 +117,73 @@ func (p *builtinProvider) Index(ctx context.Context, collection string, docs []t
 			})
 		}
 	}
-	if len(queue) == 0 {
+	if len(order) == 0 {
 		return 0, nil
 	}
 
-	written := 0
-	for start := 0; start < len(queue); start += embedBatchSize {
-		end := min(start+embedBatchSize, len(queue))
-		batch := queue[start:end]
-
-		texts := make([]string, len(batch))
-		for i, q := range batch {
-			texts[i] = q.text
+	// Drop docs that yielded zero chunks in one batched delete so a
+	// re-embed whose content shrank to empty is not silently stale.
+	var emptyDocs []string
+	for _, docID := range order {
+		if len(perDoc[docID]) == 0 {
+			emptyDocs = append(emptyDocs, docID)
 		}
-		vecs, err := p.embed.Embed(ctx, texts)
-		if err != nil {
-			return written, fmt.Errorf("embed batch %d-%d: %w", start, end, err)
-		}
-		chunks := make([]store.Chunk, 0, len(batch))
-		for i, q := range batch {
-			if i < len(vecs) && len(vecs[i]) > 0 {
-				q.chunk.Embedding = vecs[i]
-			}
-			chunks = append(chunks, q.chunk)
-		}
-		if err := p.db.PutChunks(ctx, chunks); err != nil {
-			return written, err
-		}
-		written += len(chunks)
-		slog.Debug("rag indexed batch", "collection", collection, "chunks", len(chunks))
 	}
-	return written, nil
+	if len(emptyDocs) > 0 {
+		if _, err := p.db.DeleteDocuments(ctx, collection, emptyDocs); err != nil {
+			return 0, fmt.Errorf("prune empty docs: %w", err)
+		}
+	}
+
+	// Embed every non-empty doc first, then commit ALL chunks with ONE
+	// ReplaceDocuments call. This avoids invalidating the HNSW cache once
+	// per doc — an N-doc auto-index used to rebuild the graph N times each
+	// turn; now it rebuilds it once. If embedding fails mid-way the
+	// already-persisted previous version stays intact because the store
+	// hasn't been touched yet.
+	allChunks := make([]store.Chunk, 0, len(order)*4)
+	for _, docID := range order {
+		queue := perDoc[docID]
+		if len(queue) == 0 {
+			continue
+		}
+		docStart := len(allChunks)
+		for start := 0; start < len(queue); start += embedBatchSize {
+			end := min(start+embedBatchSize, len(queue))
+			batch := queue[start:end]
+
+			texts := make([]string, len(batch))
+			for i, q := range batch {
+				texts[i] = q.text
+			}
+			vecs, err := p.embed.Embed(ctx, texts)
+			if err != nil {
+				// Nothing has been written yet; the previous version of
+				// every doc still lives in the store.
+				return 0, fmt.Errorf("embed doc %q batch %d-%d: %w", docID, start, end, err)
+			}
+			if len(vecs) != len(batch) {
+				return 0, fmt.Errorf("embed doc %q: returned %d vectors for %d inputs (batch %d-%d)",
+					docID, len(vecs), len(batch), start, end)
+			}
+			for i, q := range batch {
+				if len(vecs[i]) == 0 {
+					return 0, fmt.Errorf("embed doc %q: empty vector for input %d in batch %d-%d",
+						docID, i, start, end)
+				}
+				q.chunk.Embedding = vecs[i]
+				allChunks = append(allChunks, q.chunk)
+			}
+		}
+		slog.Debug("rag embedded document", "collection", collection, "doc", docID, "chunks", len(allChunks)-docStart)
+	}
+	if len(allChunks) == 0 {
+		return 0, nil
+	}
+	if err := p.db.ReplaceDocuments(ctx, collection, allChunks); err != nil {
+		return 0, err
+	}
+	return len(allChunks), nil
 }
 
 func (p *builtinProvider) Collections(ctx context.Context) ([]string, error) {

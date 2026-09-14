@@ -4,12 +4,13 @@ import { get, streamGet, type StreamEvent } from '@/lib/api'
 import { useI18n } from '@/lib/i18n'
 import {
   DEFAULT_MAX_LIVE_REASONING_CHARS,
-  MessageBubble,
   appendSeg,
+  normalizeErrorPayload,
   pushToolSeg,
   updateToolSeg,
   type ChatMessage,
-} from '@/pages/ChatPage'
+} from '@/lib/chatTranscript'
+import { MessageBubble } from '@/components/chat/ChatTranscript'
 
 export interface ActiveAgent {
   id: string
@@ -133,7 +134,14 @@ export function SubAgentPanel({ agent, onBack }: { agent: ActiveAgent; onBack: (
             )
             break
           case 'error':
-            patch((m) => ({ ...m, error: String(event.error ?? '') }))
+            // Route through the same normaliser as the main transcript so a
+            // sub-agent failure renders as the identical single-key JSON block
+            // — no diverging error surface between the two views.
+            patch((m) => ({
+              ...m,
+              error: normalizeErrorPayload(event.error ?? ''),
+              errorSource: 'server',
+            }))
             break
           case 'done':
             if (raf != null) {

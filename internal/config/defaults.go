@@ -44,11 +44,7 @@ func Default() *Config {
 			"custom": {
 				Kind: "custom", Label: "Custom endpoint", Enabled: false, TimeoutSecs: 300,
 			},
-			// Opt-in, like every other provider the user must bring a key for.
-			// Enabled:true here would mean that merely having CURSOR_API_KEY in
-			// the environment lets the model spawn billable cloud agents — and
-			// the default approval_mode is "auto", so nothing would prompt.
-			// Turn it on from the Providers page when you actually want it.
+			// Cloud agents are opt-in even when a key is present in the environment.
 			"cursor": {
 				Kind: "cursor-agent", Label: "Cursor Cloud Agents", Enabled: false,
 				BaseURL: "https://api.cursor.com", APIKeyEnv: "CURSOR_API_KEY", TimeoutSecs: 900,
@@ -59,7 +55,7 @@ func Default() *Config {
 			MaxConns: 8, Busy: 5000, WAL: true,
 		},
 		Server: Server{
-			Host: "0.0.0.0", Port: 8787,
+			Host: "127.0.0.1", Port: 8787,
 			// Same-origin is the safe default. Cross-origin access must be
 			// explicitly configured by the operator.
 			CORSOrigins: []string{},
@@ -73,7 +69,7 @@ func Default() *Config {
 			WrapUntrustedOutput:         true, SmartTitles: true,
 		},
 		Tools: Tools{
-			Toolset: "default", ApprovalMode: "auto", MaxOutputChars: 60000,
+			Toolset: "coding", ApprovalMode: "prompt", MaxOutputChars: 60000,
 			Timeouts: map[string]int{
 				"terminal": 300, "web_fetch": 60, "web_search": 30,
 				// VPS tools allow up to 900s per call; keep the agent envelope above that.
@@ -90,15 +86,13 @@ func Default() *Config {
 				// on first browser use.
 				Stealth: true,
 			},
-			HTTP: HTTP{Preset: "chrome-131", WrapTerminal: true},
-			Platform: map[string]string{
-				"cli": "default", "web": "default", "telegram": "default", "discord": "default",
-			},
+			HTTP:     HTTP{Preset: "chrome-131", WrapTerminal: true},
+			Platform: map[string]string{},
 		},
 		Terminal: Terminal{
 			Backend: "local", CWD: "~/antares-workspace", Timeout: 300,
 			HomeMode: "workspace", LifetimeSeconds: 3600, Shell: "",
-			Sandbox:         "none",
+			Sandbox:         "auto",
 			BlockedCommands: []string{"rm -rf /", "mkfs", ":(){:|:&};:", "shutdown", "reboot"},
 			AllowNetwork:    true, DockerImage: "debian:bookworm-slim",
 		},
@@ -146,7 +140,7 @@ func Default() *Config {
 		Logging: Logging{Level: "info", File: filepath.Join(Home(), "logs", "antares.log")},
 		MCP:     MCP{Enabled: true, Servers: map[string]MCPServer{}},
 
-		MaxConcurrentSessions: 0,
+		MaxConcurrentSessions: 4,
 		GroupSessionsPerUser:  true,
 		Social: Social{
 			Enabled:  false,

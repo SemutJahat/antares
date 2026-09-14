@@ -3,8 +3,9 @@ bin/
 .air/
 *.test
 # A cross-compile run drops the binary in the repo root; it once got committed.
-antares
-antares.exe
+# Anchored so it cannot swallow cmd/antares/ source files.
+/antares
+/antares.exe
 
 # Node
 node_modules/
@@ -20,7 +21,6 @@ web/src/sample/
 *.db-shm
 .env
 .env.local
-/antares
 /tuishot
 
 # Local agent/editor tooling (not part of the project)

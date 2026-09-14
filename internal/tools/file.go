@@ -323,6 +323,13 @@ func (editFileTool) Execute(_ context.Context, in Input) Result {
 	if err := in.Bind(&args); err != nil {
 		return Errorf("%v", err)
 	}
+	if args.OldString == "" {
+		// An empty old_string with replace_all would splice new_string between
+		// every rune of the file; without replace_all the ambiguity check
+		// misreports the match count. Either way the caller almost certainly
+		// meant write_file. Refuse rather than silently corrupt.
+		return Errorf("old_string must not be empty; use write_file to create or replace whole files")
+	}
 	if args.OldString == args.NewString {
 		return Errorf("old_string and new_string are identical")
 	}
@@ -1086,7 +1093,18 @@ func humanBytes(n int64) string {
 // writeWithCheckpoint keeps a copy of what is there before overwriting it, so
 // the change can be undone. A missing checkpoint store is not an error — it
 // only means there is nothing to roll back to.
+//
+// It refuses to write when the target path itself is a symlink. filepath's
+// EvalSymlinks (used by withinRoot) fails on a dangling link and leaves it
+// unresolved as the tail, so a workspace-visible link that points outside
+// the workspace would pass the boundary check and os.WriteFile would then
+// follow it. Refusing here closes that escape without weakening the boundary
+// for legitimate new files (Lstat on a not-yet-created path returns
+// os.ErrNotExist, which is fine).
 func writeWithCheckpoint(in Input, path string, content []byte, tool string) error {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to write through a symlink at %s", path)
+	}
 	if in.Deps != nil && in.Deps.Checkpoint != nil {
 		in.Deps.Checkpoint(in.SessionID, path, tool)
 	}

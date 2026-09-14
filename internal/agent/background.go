@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -92,6 +94,21 @@ func (a *Agent) startBackground(parent Request, req tools.SubAgentRequest) strin
 	go func() {
 		defer cancel()
 		defer untrack()
+		// Nothing above this goroutine will catch a panic — a.Run or
+		// prepareSubAgentWorkspace crashing would otherwise take the whole
+		// process down, contradicting the harness invariant that a single
+		// tool or worker must not cost the session. Record the failure as a
+		// task error so the dashboard/parent sees it, and fire the done
+		// signal so a delegating session is not left waiting forever.
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("background task panicked",
+					"task_id", id, "role", req.Role,
+					"panic", r, "stack", string(debug.Stack()))
+				a.bg.finish(id, nil, fmt.Errorf("panicked: %v", r), nil)
+				a.signalBackgroundDone(id)
+			}
+		}()
 
 		maxTurns := req.MaxTurns
 		if maxTurns <= 0 {
