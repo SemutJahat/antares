@@ -1,6 +1,10 @@
 package config
 
-import "path/filepath"
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+)
 
 // Default returns a fully populated configuration. Every field the dashboard
 // can edit has a sensible value here so the UI never renders a blank form.
@@ -50,8 +54,12 @@ func Default() *Config {
 			MaxConns: 8, Busy: 5000, WAL: true,
 		},
 		Server: Server{
-			Host: "0.0.0.0", Port: 8787,
-			// Same-origin is the safe default. Cross-origin access must be
+			Host: defaultHost(), Port: 8787,
+			// defaultHost() picks a bind address safe for where Antares is
+			// running: loopback on a laptop, wildcard inside a container so
+			// docker port-forwarding still works, or the ANTARES_HOST override
+			// when an installer / systemd unit / operator set one. Same-origin
+			// is the safe default for CORS; cross-origin access must be
 			// explicitly configured by the operator.
 			CORSOrigins: []string{},
 		},
@@ -142,4 +150,54 @@ func Default() *Config {
 			IMAPHost: "imap.gmail.com", IMAPPort: 993,
 		},
 	}
+}
+
+// defaultHost picks the address the dashboard should bind to when the config
+// leaves server.host empty. Precedence, high to low:
+//
+//  1. ANTARES_HOST — installers, systemd units, and one-off overrides win
+//     over every heuristic. An empty value is ignored so a stray `export
+//     ANTARES_HOST=` in a shell profile does not break the default.
+//  2. Container heuristic — inside Docker / Podman / Kubernetes the process
+//     must bind the wildcard address for host port forwarding to reach it.
+//  3. Loopback fallback — everything else. Fresh installs on a laptop stay
+//     on this machine only; ValidateListen still refuses a non-loopback
+//     bind without an auth token or dashboard password if the user opts in
+//     via config or ANTARES_HOST.
+func defaultHost() string {
+	if h := os.Getenv("ANTARES_HOST"); h != "" {
+		return h
+	}
+	if inContainer() {
+		return "0.0.0.0"
+	}
+	return "127.0.0.1"
+}
+
+// containerProbe is the seam tests replace to simulate running inside a
+// container without needing Docker. Production code calls the real probe.
+var containerProbe = detectContainer
+
+// inContainer reports whether Antares is running inside a container. It goes
+// through the swappable containerProbe so tests can stub the answer.
+func inContainer() bool { return containerProbe() }
+
+// detectContainer looks at filesystem markers Docker, Podman, and
+// Kubernetes leave in the container image. Any failure means "not detected"
+// — the loopback fallback is the safe answer if we cannot tell.
+func detectContainer() bool {
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	if _, err := os.Stat("/run/.containerenv"); err == nil {
+		return true
+	}
+	if b, err := os.ReadFile("/proc/1/cgroup"); err == nil {
+		if bytes.Contains(b, []byte("docker")) ||
+			bytes.Contains(b, []byte("kubepods")) ||
+			bytes.Contains(b, []byte("containerd")) {
+			return true
+		}
+	}
+	return false
 }
