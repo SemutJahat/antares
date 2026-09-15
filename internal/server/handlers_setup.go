@@ -253,14 +253,24 @@ func (s *Server) handleSetupTest(w http.ResponseWriter, r *http.Request) {
 			apiKey = p.APIKey
 		}
 	}
-	headers := cfg.Providers[body.Provider].Headers
-	if chosen.Custom && body.Headers != nil {
-		var err error
-		headers, err = config.NormalizeProviderHeaders(body.Headers)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
+	// Headers are wizard-scoped: a custom setup mints a fresh provider id at
+	// save time, so any headers stored under the legacy "custom" slot belong
+	// to a different target and must not be forwarded here — that would leak
+	// unrelated credentials to whatever base URL the user just typed in. For
+	// built-in providers the slot key matches the stored entry, so reusing
+	// its recorded headers on a reconnect is safe.
+	var headers map[string]string
+	if chosen.Custom {
+		if body.Headers != nil {
+			normalized, err := config.NormalizeProviderHeaders(body.Headers)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			headers = normalized
 		}
+	} else {
+		headers = cfg.Providers[body.Provider].Headers
 	}
 	// A keyless custom service on a LAN is legitimate; everything else needs
 	// a credential unless the endpoint is local.
@@ -399,9 +409,14 @@ func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 		entry.BaseURL = baseURL
 	}
 	if chosen.Custom {
-		if entry.Headers == nil {
-			entry.Headers = cfg.Providers[body.Provider].Headers
-		}
+		// A named custom provider mints its own id (providerID), separate from
+		// the legacy "custom" slot the wizard picker uses (body.Provider).
+		// The freshly minted entry starts with no stored headers; only headers
+		// explicitly submitted for this provider are persisted. Falling back
+		// to the legacy slot here silently attached whatever credential lived
+		// under "custom" to an unrelated host. Editing an existing entry with
+		// omitted headers still keeps its own recorded headers, since we read
+		// them from cfg.Providers[providerID] above.
 		if body.Headers != nil {
 			headers, err := config.NormalizeProviderHeaders(body.Headers)
 			if err != nil {

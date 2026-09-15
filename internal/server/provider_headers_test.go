@@ -261,3 +261,158 @@ func TestHeaderAuthenticatedCustomProviderIsReadyAndDiscoverable(t *testing.T) {
 		t.Fatalf("all provider models = %#v", allBody.Models)
 	}
 }
+
+// TestSetupCompleteDoesNotLeakLegacyCustomHeaders guards a credential leak:
+// the legacy "custom" catalogue slot may already hold an Authorization header
+// from an earlier configuration. Naming a new custom provider mints a fresh
+// id ("header-setup" here), and its entry must not silently inherit those
+// headers — that would forward an unrelated bearer token to the newly typed
+// base URL. Explicitly submitted headers still land on the new provider, and
+// the legacy slot is left exactly as it was.
+func TestSetupCompleteDoesNotLeakLegacyCustomHeaders(t *testing.T) {
+	fixture, _ := headerProviderFixture(t)
+	home := t.TempDir()
+	t.Setenv("ANTARES_HOME", home)
+	cfg := config.Default()
+	cfg.Model.Default = ""
+	// The legacy "custom" slot carries a bearer that belongs to a different
+	// host; naming a new provider must not carry it over.
+	cfg.Providers["custom"] = config.Provider{
+		Kind:    "openai-compatible",
+		BaseURL: "https://legacy.example.com/v1",
+		Headers: map[string]string{"Authorization": "Bearer legacy-secret"},
+	}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(t.Context(), "sqlite", filepath.Join(t.TempDir(), "leak.db"), 1, 5000, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{cfg: cfg, db: db, agent: agent.New(cfg, db, nil, nil, nil)}
+
+	// New host, new name, no headers submitted. The wizard's `provider` field
+	// stays "custom" (the catalogue picker id); the save target is minted from
+	// the name.
+	body := `{"provider":"custom","name":"Fresh Host","base_url":"` + fixture.URL + `/v1","model":"header-model","workspace":"` + filepath.Join(t.TempDir(), "ws") + `"}`
+	r := providerJSONRequest(http.MethodPost, "/api/setup/complete", body)
+	r.RemoteAddr = "127.0.0.1:12345"
+	rr := httptest.NewRecorder()
+	s.handleSetupComplete(rr, r)
+	assertProviderOK(t, rr)
+
+	reloaded, err := config.Reload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, ok := reloaded.Providers["fresh-host"]
+	if !ok {
+		t.Fatalf("new provider not saved; providers = %#v", reloaded.Providers)
+	}
+	if _, leaked := fresh.Headers["Authorization"]; leaked {
+		t.Fatalf("legacy custom Authorization leaked onto new provider: %#v", fresh.Headers)
+	}
+	if len(fresh.Headers) != 0 {
+		t.Fatalf("new provider inherited unexpected headers: %#v", fresh.Headers)
+	}
+	legacy := reloaded.Providers["custom"]
+	if got := legacy.Headers["Authorization"]; got != "Bearer legacy-secret" {
+		t.Fatalf("legacy custom entry mutated: %#v", legacy.Headers)
+	}
+	if legacy.BaseURL != "https://legacy.example.com/v1" {
+		t.Fatalf("legacy custom base URL mutated: %q", legacy.BaseURL)
+	}
+}
+
+// TestSetupCompleteKeepsExplicitNewHeaders is the companion assertion: the
+// wizard must still persist headers the user typed in for the new provider,
+// even when the legacy custom slot is holding something entirely different.
+func TestSetupCompleteKeepsExplicitNewHeaders(t *testing.T) {
+	fixture, expected := headerProviderFixture(t)
+	home := t.TempDir()
+	t.Setenv("ANTARES_HOME", home)
+	cfg := config.Default()
+	cfg.Model.Default = ""
+	cfg.Providers["custom"] = config.Provider{
+		Kind:    "openai-compatible",
+		BaseURL: "https://legacy.example.com/v1",
+		Headers: map[string]string{"Authorization": "Bearer legacy-secret"},
+	}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(t.Context(), "sqlite", filepath.Join(t.TempDir(), "keep.db"), 1, 5000, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{cfg: cfg, db: db, agent: agent.New(cfg, db, nil, nil, nil)}
+
+	body := `{"provider":"custom","name":"Named Host","base_url":"` + fixture.URL + `/v1","headers":{"X-Tenant":"team=a=b"},"model":"header-model","workspace":"` + filepath.Join(t.TempDir(), "ws") + `"}`
+	r := providerJSONRequest(http.MethodPost, "/api/setup/complete", body)
+	r.RemoteAddr = "127.0.0.1:12345"
+	rr := httptest.NewRecorder()
+	s.handleSetupComplete(rr, r)
+	assertProviderOK(t, rr)
+
+	reloaded, err := config.Reload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := reloaded.Providers["named-host"]
+	if got := fresh.Headers["X-Tenant"]; got != *expected {
+		t.Fatalf("explicit header dropped: %#v", fresh.Headers)
+	}
+	if _, leaked := fresh.Headers["Authorization"]; leaked {
+		t.Fatalf("legacy Authorization still leaked: %#v", fresh.Headers)
+	}
+}
+
+// TestSetupTestDoesNotForwardLegacyCustomHeaders locks the sibling behaviour
+// on the wizard's dry-run endpoint: pointing a custom probe at a new base URL
+// must not attach whatever Authorization the legacy custom slot happens to
+// hold. The fixture returns 401 whenever the wrong Authorization arrives, so
+// a leaked bearer would flip ok to false with an auth error.
+func TestSetupTestDoesNotForwardLegacyCustomHeaders(t *testing.T) {
+	expected := "team=a=b"
+	// The fixture rejects any request that carries the leaked Authorization
+	// header, so a cross-origin leak surfaces as ok:false rather than 200.
+	fixture := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/v1/models" || r.Header.Get("X-Tenant") != expected {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"header-model","owned_by":"test"}]}`))
+	}))
+	t.Cleanup(fixture.Close)
+
+	home := t.TempDir()
+	t.Setenv("ANTARES_HOME", home)
+	cfg := config.Default()
+	cfg.Model.Default = ""
+	cfg.Providers["custom"] = config.Provider{
+		Kind:    "openai-compatible",
+		BaseURL: "https://legacy.example.com/v1",
+		Headers: map[string]string{"Authorization": "Bearer legacy-secret"},
+	}
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(t.Context(), "sqlite", filepath.Join(t.TempDir(), "probe.db"), 1, 5000, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{cfg: cfg, db: db, agent: agent.New(cfg, db, nil, nil, nil)}
+
+	// Explicit headers submitted for the new host: only these should reach the
+	// probe. Legacy Authorization must stay parked in its own slot.
+	r := providerJSONRequest(http.MethodPost, "/api/setup/test", `{"provider":"custom","base_url":"`+fixture.URL+`/v1","headers":{"X-Tenant":"team=a=b"}}`)
+	r.RemoteAddr = "127.0.0.1:12345"
+	rr := httptest.NewRecorder()
+	s.handleSetupTest(rr, r)
+	assertProviderOK(t, rr)
+}
