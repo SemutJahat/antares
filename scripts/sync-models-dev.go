@@ -23,6 +23,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/enowdev/antares/internal/providers"
 )
 
 const (
@@ -31,35 +33,14 @@ const (
 )
 
 // providersOfInterest selects which models.dev provider blocks land in the
-// generated file. Adding a new provider to internal/providers/catalog.go is
-// worth mirroring here so its models pick up metadata automatically. The set
-// is intentionally conservative: it keeps the generated file bounded and
-// avoids leaking niche providers that Antares users are unlikely to see.
+// generated file. The set is the shared runtime allowlist exported from
+// internal/providers — any provider the runtime refresh keeps, the bundled
+// snapshot MUST include, or a warm start pulls entries the runtime would
+// then discard on the next live refresh.
 //
-// Values are the provider IDs models.dev uses. Cross-reference the models.dev
-// UI or `curl https://models.dev/api.json | jq keys` when adding one.
-var providersOfInterest = map[string]bool{
-	"anthropic":     true,
-	"openai":        true,
-	"google":        true, // Gemini
-	"openrouter":    true,
-	"groq":          true,
-	"xai":           true,
-	"deepseek":      true,
-	"zai":           true,
-	"opencode":      true, // OpenCode Zen
-	"ollama":        true,
-	"mistral":       true,
-	"cohere":        true,
-	"perplexity":    true,
-	"fireworks-ai":  true,
-	"togetherai":    true,
-	"kimi-for-coding": true,
-	"minimax":       true,
-	"alibaba":       true, // Qwen family
-	"github-copilot": true,
-	"nvidia":        true,
-}
+// To add a provider: edit allowedProviders in internal/providers/refresh.go.
+// Both this generator and the runtime refresh pick it up automatically.
+var providersOfInterest = providers.AllowedProviders()
 
 // apiPayload mirrors the pieces of models.dev/api.json this generator reads.
 // Anything not named here is discarded — the catalogue carries a lot of fields
@@ -73,19 +54,19 @@ type providerPayload struct {
 }
 
 type modelPayload struct {
-	ID              string         `json:"id"`
-	Name            string         `json:"name"`
-	Family          string         `json:"family"`
-	Attachment      bool           `json:"attachment"`
-	Reasoning       bool           `json:"reasoning"`
-	ToolCall        bool           `json:"tool_call"`
-	Knowledge       string         `json:"knowledge"`
-	ReleaseDate     string         `json:"release_date"`
-	LastUpdated     string         `json:"last_updated"`
-	OpenWeights     bool           `json:"open_weights"`
-	Modalities      modalityBlock  `json:"modalities"`
-	Limit           limitBlock     `json:"limit"`
-	Cost            costBlock      `json:"cost"`
+	ID          string        `json:"id"`
+	Name        string        `json:"name"`
+	Family      string        `json:"family"`
+	Attachment  bool          `json:"attachment"`
+	Reasoning   bool          `json:"reasoning"`
+	ToolCall    bool          `json:"tool_call"`
+	Knowledge   string        `json:"knowledge"`
+	ReleaseDate string        `json:"release_date"`
+	LastUpdated string        `json:"last_updated"`
+	OpenWeights bool          `json:"open_weights"`
+	Modalities  modalityBlock `json:"modalities"`
+	Limit       limitBlock    `json:"limit"`
+	Cost        costBlock     `json:"cost"`
 }
 
 type modalityBlock struct {
@@ -162,24 +143,24 @@ func fetch() (apiPayload, time.Time, error) {
 
 // entry is the flattened shape emitted to Go source. Key = "provider/model".
 type entry struct {
-	ProviderID    string
-	ModelID       string
-	Name          string
-	Family        string
-	ContextWindow int
-	MaxOutput     int
-	CostInput     float64
-	CostOutput    float64
-	CostCacheRead float64
+	ProviderID     string
+	ModelID        string
+	Name           string
+	Family         string
+	ContextWindow  int
+	MaxOutput      int
+	CostInput      float64
+	CostOutput     float64
+	CostCacheRead  float64
 	CostCacheWrite float64
-	Reasoning     bool
-	ToolCall      bool
-	Attachment    bool
-	Vision        bool
-	PDF           bool
-	OpenWeights   bool
-	Knowledge     string
-	ReleaseDate   string
+	Reasoning      bool
+	ToolCall       bool
+	Attachment     bool
+	Vision         bool
+	PDF            bool
+	OpenWeights    bool
+	Knowledge      string
+	ReleaseDate    string
 }
 
 func extract(payload apiPayload) []entry {

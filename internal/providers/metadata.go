@@ -149,6 +149,7 @@ func MetaByAnyProvider(model string) (ModelMeta, bool) {
 	}
 	return lookupBareID(model)
 }
+
 // lookupBareID scans the generated table for any entry whose bare model id
 // matches, with slug normalisation. Prefers first-party providers (anthropic,
 // openai, google) when several proxies re-list the same model so a lookup for
@@ -156,19 +157,42 @@ func MetaByAnyProvider(model string) (ModelMeta, bool) {
 func lookupBareID(model string) (ModelMeta, bool) {
 	variants := append([]string{model}, slugVariants(model)...)
 	var best ModelMeta
+	var bestKey string
+	var bestExact bool
 	var found bool
-	for _, m := range generatedModels() {
+	for key, m := range generatedModels() {
 		if !containsAny(variants, m.ID) {
 			continue
 		}
+		exact := m.ID == model
 		m.Source = "generated"
 		if !found {
-			best = m
-			found = true
+			best, bestKey, bestExact, found = m, key, exact, true
 			continue
 		}
-		if firstPartyRank(m.Provider) < firstPartyRank(best.Provider) {
-			best = m
+		// Preference order: exact ID match > first-party provider rank >
+		// deterministic stored-key tie-break. Exact match wins over a slug
+		// variant even from a higher-ranked provider — if a caller passed
+		// "claude-opus-4.7" and one entry has that id verbatim while
+		// another only matches via the dot/dash flip, the verbatim entry
+		// is what the caller asked for.
+		//
+		// The final key < bestKey tie-break is load-bearing: map iteration
+		// is randomised, so two same-rank candidates
+		// (e.g. alibaba/qwen3.5-plus vs opencode/qwen3.5-plus) would flip
+		// winner run-to-run without it, giving callers phantom pricing
+		// changes on repeat lookups.
+		switch {
+		case exact && !bestExact:
+			best, bestKey, bestExact = m, key, exact
+		case exact == bestExact:
+			rBest, rNew := firstPartyRank(best.Provider), firstPartyRank(m.Provider)
+			switch {
+			case rNew < rBest:
+				best, bestKey, bestExact = m, key, exact
+			case rNew == rBest && key < bestKey:
+				best, bestKey, bestExact = m, key, exact
+			}
 		}
 	}
 	return best, found
@@ -202,7 +226,13 @@ func slugVariants(model string) []string {
 }
 
 // firstPartyRank returns a lower number for first-party providers so
-// lookupBareID prefers them over re-listings. Unknown providers rank last.
+// lookupBareID prefers them over re-listings. Unknown providers rank last;
+// ties fall through to a deterministic key-based tie-break in the caller
+// so lookups stay stable across map-iteration reshuffles.
+//
+// alibaba is the first-party home for the Qwen family — treat it as a
+// well-known lab so "qwen3.5-plus" resolves to alibaba's numbers rather
+// than opencode's re-listing.
 func firstPartyRank(provider string) int {
 	switch provider {
 	case "anthropic":
@@ -211,7 +241,7 @@ func firstPartyRank(provider string) int {
 		return 1
 	case "google":
 		return 2
-	case "xai", "deepseek", "mistral", "cohere", "groq":
+	case "xai", "deepseek", "mistral", "cohere", "groq", "alibaba":
 		return 3
 	default:
 		return 4
@@ -252,7 +282,6 @@ var (
 type parseErr struct{ msg string }
 
 func (e *parseErr) Error() string { return e.msg }
-
 
 // legacyContextWindow bridges the old package-level contextWindows map. It
 // exists so metadata.go stays the single lookup surface even while callers

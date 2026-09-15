@@ -82,7 +82,11 @@ func refreshLoop(ctx context.Context) {
 	// Disk cache first — persisted across restarts, so a warm boot on an
 	// offline laptop still has whatever the last online session pulled.
 	if raw, ok := readDiskCache(); ok {
-		if table, err := parseGeneratedModels(raw); err == nil {
+		if table, err := parseGeneratedModels(raw); err == nil && len(table) > 0 {
+			// Same guard as tryRefresh: a decoded-but-empty cache would
+			// clobber the bundled snapshot with nothing. Leaves the embed
+			// in place until either a live fetch lands or a non-empty
+			// cache appears.
 			setGeneratedModels(table)
 		}
 	}
@@ -118,6 +122,14 @@ func tryRefresh(ctx context.Context) {
 	// cache and in-memory table both match the bundled schema.
 	table, err := normaliseLive(raw)
 	if err != nil {
+		return
+	}
+	// An empty result (upstream returned {}, or every provider fell outside
+	// the allowlist) would silently blank the bundled snapshot. Keep the
+	// prior in-memory table and the on-disk cache — the current data is
+	// always more useful than none, and a real outage should degrade to the
+	// last-known-good, not to a lookup miss for every model.
+	if len(table) == 0 {
 		return
 	}
 	setGeneratedModels(table)
@@ -227,19 +239,57 @@ func normaliseLive(raw []byte) (map[string]ModelMeta, error) {
 	return out, nil
 }
 
-// providerAllowed mirrors scripts/sync-models-dev.go's providersOfInterest.
-// Kept in a small helper here so the two don't drift silently: any provider
-// the sync script would bundle, the runtime refresh should also accept.
-// The list is small; a slice keeps the diff obvious.
+// providerAllowed reports whether the runtime refresh should keep a
+// models.dev provider block. Delegates to allowedProviders — the single
+// source of truth shared with scripts/sync-models-dev.go so the runtime
+// and the build-time snapshot can never disagree about which providers
+// exist.
 func providerAllowed(id string) bool {
-	switch id {
-	case "anthropic", "openai", "google", "google-vertex", "azure",
-		"amazon-bedrock", "openrouter", "opencode", "deepseek", "mistral",
-		"xai", "cohere", "groq", "fireworks-ai", "together-ai",
-		"perplexity", "cerebras", "sambanova", "meta-llama":
-		return true
+	return allowedProviders[id]
+}
+
+// allowedProviders is the shared allowlist consumed by both the runtime
+// refresh loop (refresh.go) and the build-time snapshot generator
+// (scripts/sync-models-dev.go). Add a provider here and both paths pick it
+// up on the next build/refresh — no drift between the two.
+//
+// Keys are the provider ids models.dev uses. Cross-reference the
+// models.dev UI or `curl https://models.dev/api.json | jq keys` when
+// adding one.
+var allowedProviders = map[string]bool{
+	"anthropic":       true,
+	"openai":          true,
+	"google":          true, // Gemini
+	"openrouter":      true,
+	"groq":            true,
+	"xai":             true,
+	"deepseek":        true,
+	"zai":             true,
+	"opencode":        true, // OpenCode Zen
+	"ollama":          true,
+	"mistral":         true,
+	"cohere":          true,
+	"perplexity":      true,
+	"fireworks-ai":    true,
+	"togetherai":      true,
+	"kimi-for-coding": true,
+	"minimax":         true,
+	"alibaba":         true, // Qwen family
+	"github-copilot":  true,
+	"nvidia":          true,
+}
+
+// AllowedProviders returns a copy of the shared allowlist keyed by
+// models.dev provider id. Callers outside this package (notably the
+// build-time sync script) use it to guarantee the runtime and the
+// bundled snapshot agree on which providers are supported. The copy is
+// intentional: nothing external should mutate the runtime table.
+func AllowedProviders() map[string]bool {
+	out := make(map[string]bool, len(allowedProviders))
+	for k, v := range allowedProviders {
+		out[k] = v
 	}
-	return false
+	return out
 }
 
 // stripPrefix drops a redundant "provider/" prefix some entries carry

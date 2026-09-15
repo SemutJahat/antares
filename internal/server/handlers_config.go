@@ -406,7 +406,11 @@ func enrichModelInfo(providerID string, m llm.ModelInfo, kind string) llm.ModelI
 	if m.OutputCost == 0 && meta.Cost.Output > 0 {
 		m.OutputCost = meta.Cost.Output
 	}
-	if !m.Vision && (meta.Vision || meta.Attachment) {
+	// Vision is a strict input-modality claim ("this model reads image
+	// bytes"). meta.Attachment is broader — it flips on for PDF/audio/video
+	// too — so folding it into Vision would mark an audio-only model as
+	// vision-capable and let the picker feed it images it will reject.
+	if !m.Vision && meta.Vision {
 		m.Vision = true
 	}
 	if !m.Tools && meta.ToolCall {
