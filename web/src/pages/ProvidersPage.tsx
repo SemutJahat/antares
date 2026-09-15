@@ -13,9 +13,11 @@ import {
   Trash,
 } from '@phosphor-icons/react'
 import { del, get, post } from '@/lib/api'
+import { formatProviderHeaders, parseProviderHeaders } from '@/lib/providerHeaders'
 import { useApi } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
+import { ProviderHeadersField } from '@/components/providers/ProviderHeadersField'
 import { PageLayout } from '@/components/layout/PageLayout'
 import { Button } from '@/components/ui/button'
 import { Badge, Card, EmptyState, Input, Label, Tabs, TabsList, TabsTrigger } from '@/components/ui/primitives'
@@ -50,6 +52,7 @@ interface ProviderInfo {
   needs_api_version?: boolean
   needs_base_url?: boolean
   timeout_seconds?: number
+  headers?: Record<string, string>
   custom?: boolean
 }
 
@@ -87,7 +90,7 @@ const GROUP_ORDER: Group[] = ['oauth', 'apikey', 'local']
 
 function ProviderStatus({ provider }: { provider: ProviderInfo }) {
   const { t } = useI18n()
-  if (provider.has_key) {
+	if (provider.has_key || (provider.custom && Object.keys(provider.headers ?? {}).length > 0)) {
     return (
       <Badge variant="success" className="shrink-0">
         <CheckCircle className="size-3" weight="fill" />
@@ -180,10 +183,10 @@ function ProvidersTab({ onOpenModels }: { onOpenModels: () => void }) {
                         ) : (
                           <Button
                             size="sm"
-                            variant={p.has_key ? 'outline' : 'default'}
-                            onClick={() => setTarget(p)}
-                          >
-                            {p.has_key ? t('providers.manage') : t('models.connect')}
+	                            variant={p.has_key || (p.custom && Object.keys(p.headers ?? {}).length > 0) ? 'outline' : 'default'}
+	                            onClick={() => setTarget(p)}
+	                          >
+	                            {p.has_key || (p.custom && Object.keys(p.headers ?? {}).length > 0) ? t('providers.manage') : t('models.connect')}
                           </Button>
                         )}
                       </div>
@@ -239,11 +242,20 @@ function AddProviderDialog({
   const [name, setName] = useState('')
   const [baseURL, setBaseURL] = useState('')
   const [key, setKey] = useState('')
+  const [headersText, setHeadersText] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
 
   const create = async () => {
     if (!name.trim() || !baseURL.trim()) return
+    let headers: Record<string, string>
+    try {
+      headers = parseProviderHeaders(headersText)
+    } catch {
+      setError(t('providers.headersInvalid'))
+      return
+    }
+
     setBusy(true)
     setError(undefined)
     try {
@@ -251,6 +263,7 @@ function AddProviderDialog({
         name: name.trim(),
         base_url: baseURL.trim(),
         api_key: key.trim(),
+        headers,
       })
       if (!r.ok) {
         setError(r.error ?? t('models.connectFailed'))
@@ -309,6 +322,7 @@ function AddProviderDialog({
             />
             <p className="text-[11px] text-muted-foreground">{t('providers.keyOptional')}</p>
           </div>
+          <ProviderHeadersField id="np-headers" value={headersText} onChange={setHeadersText} />
           {error ? (
             <p className="rounded-[var(--radius-sm)] border border-destructive/40 bg-destructive/10 p-2.5 text-xs text-destructive">{error}</p>
           ) : null}
@@ -408,6 +422,7 @@ function ProviderModal({
   // Advanced
   const [label, setLabel] = useState(p.label)
   const [timeout, setTimeoutSecs] = useState(String(p.timeout_seconds ?? ''))
+  const [headersText, setHeadersText] = useState(() => formatProviderHeaders(p.headers))
 
   // A local runtime needs no key; bedrock takes AWS env credentials. A custom
   // provider usually wants one but a keyless service is fine, so the field is
@@ -487,14 +502,25 @@ function ProviderModal({
   }
 
   const saveSettings = async () => {
+    let headers: Record<string, string> | undefined
+    try {
+      headers = p.custom ? parseProviderHeaders(headersText) : undefined
+    } catch {
+      setError(t('providers.headersInvalid'))
+      return
+    }
+
     setBusy(true)
+    setError(undefined)
     try {
       await post(`/providers/${encodeURIComponent(p.id)}/settings`, {
         base_url: baseURL.trim(),
         timeout_seconds: timeout ? Number(timeout) : 0,
-        ...(p.custom ? { label: label.trim() } : {}),
+        ...(p.custom ? { label: label.trim(), headers } : {}),
       })
       onChanged()
+    } catch (e) {
+      setError((e as Error).message)
     } finally {
       setBusy(false)
     }
@@ -676,6 +702,10 @@ function ProviderModal({
                 <Input id="m-timeout" value={timeout} onChange={(e) => setTimeoutSecs(e.target.value)} placeholder="0" inputMode="numeric" />
                 <p className="text-[11px] text-muted-foreground">{t('providers.timeoutHint')}</p>
               </div>
+              {p.custom ? <ProviderHeadersField id="m-headers" value={headersText} onChange={setHeadersText} /> : null}
+              {error ? (
+                <p className="rounded-[var(--radius-sm)] border border-destructive/40 bg-destructive/10 p-2.5 text-xs text-destructive">{error}</p>
+              ) : null}
             </>
           ) : null}
         </DialogBody>

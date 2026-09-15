@@ -24,17 +24,7 @@ import (
 )
 
 // needsSetup reports whether Antares has enough configuration to answer at all.
-func needsSetup(cfg *config.Config) bool {
-	if strings.TrimSpace(cfg.Model.Default) == "" {
-		return true
-	}
-	_, p := cfg.ResolveProvider(cfg.Model.Provider)
-	// A local endpoint needs no credential; everything else does.
-	if p.APIKey == "" && !isLocalEndpoint(p.BaseURL) {
-		return true
-	}
-	return false
-}
+func needsSetup(cfg *config.Config) bool { return server.NeedsSetup(cfg) }
 
 func isLocalEndpoint(url string) bool {
 	l := strings.ToLower(url)
@@ -305,6 +295,7 @@ func runTerminalSetup(ctx context.Context, rt *runtimeServices) error {
 		if entry.BaseURL == "" {
 			return errors.New("a base URL is required for a custom provider")
 		}
+		entry.Headers = promptProviderHeaders()
 	case "ollama":
 		entry.BaseURL = promptLine("\n  Ollama URL (default http://127.0.0.1:11434/v1): ", "http://127.0.0.1:11434/v1")
 	case "lmstudio":
@@ -318,13 +309,13 @@ func runTerminalSetup(ctx context.Context, rt *runtimeServices) error {
 			fmt.Printf("  API key  %s\n", dim(chosen.keyHint))
 		}
 		key := promptSecret("  Paste it here (input hidden): ")
-		if key == "" && entry.APIKey == "" {
+		if key == "" && entry.APIKey == "" && len(entry.Headers) == 0 {
 			fmt.Println("\n  " + warn("No key entered — Antares will not be able to answer until one is set."))
 		} else if key != "" {
 			entry.APIKey = key
 		}
 	}
-	cfg.Providers[chosen.id] = entry
+	cfg.Providers[cfg.Model.Provider] = entry
 
 	// 4. Model, verified against the provider when possible
 	fmt.Println()
@@ -525,6 +516,45 @@ func promptLine(question, def string) string {
 		return def
 	}
 	return line
+}
+
+func promptProviderHeaders() map[string]string {
+	headers := make(map[string]string)
+	fmt.Println("  Headers (optional): enter HEADER=VALUE, one per line; blank line finishes.")
+	for {
+		fmt.Print("  Header: ")
+		line, err := stdinReader.ReadString('\n')
+		if err != nil && len(line) == 0 {
+			return headers
+		}
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		if strings.Trim(line, " \t") == "" {
+			return headers
+		}
+		firstEquals := strings.IndexByte(line, '=')
+		if firstEquals == -1 {
+			if strings.HasPrefix(strings.TrimLeft(line, " \t"), "#") {
+				continue
+			}
+			fmt.Println("  " + warn("Invalid header entry; use a unique HEADER=VALUE."))
+			continue
+		}
+
+		candidate, validationErr := config.NormalizeProviderHeaders(map[string]string{
+			line[:firstEquals]: line[firstEquals+1:],
+		})
+		if validationErr != nil {
+			fmt.Println("  " + warn("Invalid header entry; use a unique HEADER=VALUE."))
+			continue
+		}
+		for name, value := range candidate {
+			if _, exists := headers[name]; exists {
+				fmt.Println("  " + warn("Invalid header entry; use a unique HEADER=VALUE."))
+				continue
+			}
+			headers[name] = value
+		}
+	}
 }
 
 // promptSecret reads without echoing, falling back to a visible read when the

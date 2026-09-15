@@ -175,8 +175,16 @@ func NeedsSetup(cfg *config.Config) bool {
 	if strings.TrimSpace(cfg.Model.Default) == "" {
 		return true
 	}
-	_, p := cfg.ResolveProvider(cfg.Model.Provider)
-	return p.APIKey == "" && !isLocalEndpoint(p.BaseURL)
+	id, p := cfg.ResolveProvider(cfg.Model.Provider)
+	return p.APIKey == "" && !isLocalEndpoint(p.BaseURL) && !customProviderHasHeaders(cfg, id, p)
+}
+
+func customProviderHasHeaders(cfg *config.Config, id string, p config.Provider) bool {
+	if strings.TrimSpace(p.BaseURL) == "" || len(p.Headers) == 0 {
+		return false
+	}
+	provider := lookupSetupProvider(cfg, id)
+	return provider == nil || provider.Custom
 }
 
 func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
@@ -202,9 +210,10 @@ func (s *Server) handleSetupTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Provider string `json:"provider"`
-		BaseURL  string `json:"base_url"`
-		APIKey   string `json:"api_key"`
+		Provider string            `json:"provider"`
+		BaseURL  string            `json:"base_url"`
+		APIKey   string            `json:"api_key"`
+		Headers  map[string]string `json:"headers"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -244,6 +253,25 @@ func (s *Server) handleSetupTest(w http.ResponseWriter, r *http.Request) {
 			apiKey = p.APIKey
 		}
 	}
+	// Headers are wizard-scoped: a custom setup mints a fresh provider id at
+	// save time, so any headers stored under the legacy "custom" slot belong
+	// to a different target and must not be forwarded here — that would leak
+	// unrelated credentials to whatever base URL the user just typed in. For
+	// built-in providers the slot key matches the stored entry, so reusing
+	// its recorded headers on a reconnect is safe.
+	var headers map[string]string
+	if chosen.Custom {
+		if body.Headers != nil {
+			normalized, err := config.NormalizeProviderHeaders(body.Headers)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			headers = normalized
+		}
+	} else {
+		headers = cfg.Providers[body.Provider].Headers
+	}
 	// A keyless custom service on a LAN is legitimate; everything else needs
 	// a credential unless the endpoint is local.
 	if apiKey == "" && !chosen.Custom && !isLocalEndpoint(baseURL) {
@@ -254,7 +282,7 @@ func (s *Server) handleSetupTest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client, err := llm.New(llm.Options{
-		Kind: chosen.Kind, BaseURL: baseURL, APIKey: apiKey,
+		Kind: chosen.Kind, BaseURL: baseURL, APIKey: apiKey, Headers: headers,
 		ProviderID: body.Provider, Timeout: 30 * time.Second,
 	})
 	if err != nil {
@@ -305,12 +333,13 @@ func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Provider  string `json:"provider"`
-		Name      string `json:"name"`
-		BaseURL   string `json:"base_url"`
-		APIKey    string `json:"api_key"`
-		Model     string `json:"model"`
-		Workspace string `json:"workspace"`
+		Provider  string            `json:"provider"`
+		Name      string            `json:"name"`
+		BaseURL   string            `json:"base_url"`
+		APIKey    string            `json:"api_key"`
+		Headers   map[string]string `json:"headers"`
+		Model     string            `json:"model"`
+		Workspace string            `json:"workspace"`
 		Database  struct {
 			Driver string `json:"driver"`
 			DSN    string `json:"dsn"`
@@ -378,6 +407,24 @@ func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	if baseURL != "" {
 		entry.BaseURL = baseURL
+	}
+	if chosen.Custom {
+		// A named custom provider mints its own id (providerID), separate from
+		// the legacy "custom" slot the wizard picker uses (body.Provider).
+		// The freshly minted entry starts with no stored headers; only headers
+		// explicitly submitted for this provider are persisted. Falling back
+		// to the legacy slot here silently attached whatever credential lived
+		// under "custom" to an unrelated host. Editing an existing entry with
+		// omitted headers still keeps its own recorded headers, since we read
+		// them from cfg.Providers[providerID] above.
+		if body.Headers != nil {
+			headers, err := config.NormalizeProviderHeaders(body.Headers)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			entry.Headers = headers
+		}
 	}
 	if key := strings.TrimSpace(body.APIKey); key != "" && !strings.Contains(key, "••••") {
 		entry.APIKey = key
@@ -551,7 +598,7 @@ func (s *Server) handleSetProviderKey(w http.ResponseWriter, r *http.Request) {
 
 	// Reject a bad key here rather than saving it and failing on the next turn.
 	client, err := llm.New(llm.Options{
-		Kind: entry.Kind, BaseURL: baseURL, APIKey: key,
+		Kind: entry.Kind, BaseURL: baseURL, APIKey: key, Headers: entry.Headers,
 		Region: region, APIVersion: apiVersion,
 		ProviderID: id, Timeout: 30 * time.Second,
 	})

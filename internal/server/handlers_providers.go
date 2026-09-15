@@ -188,6 +188,14 @@ func (s *Server) handleProviderSettings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	p := cfg.Providers[id]
+	if body.Headers != nil {
+		headers, err := config.NormalizeProviderHeaders(body.Headers)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		p.Headers = headers
+	}
 	// Custom providers (user-named entries, plus the legacy "custom" slot) may
 	// point at loopback or LAN addresses; built-ins keep their catalogue rule.
 	sp := lookupSetupProvider(cfg, id)
@@ -211,9 +219,6 @@ func (s *Server) handleProviderSettings(w http.ResponseWriter, r *http.Request) 
 	if body.TimeoutSecs != nil {
 		p.TimeoutSecs = *body.TimeoutSecs
 	}
-	if body.Headers != nil {
-		p.Headers = body.Headers
-	}
 	cfg.Providers[id] = p
 
 	if err := config.Save(cfg); err != nil {
@@ -236,11 +241,17 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name    string `json:"name"`
-		BaseURL string `json:"base_url"`
-		APIKey  string `json:"api_key"`
+		Name    string            `json:"name"`
+		BaseURL string            `json:"base_url"`
+		APIKey  string            `json:"api_key"`
+		Headers map[string]string `json:"headers"`
 	}
 	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	headers, err := config.NormalizeProviderHeaders(body.Headers)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -269,9 +280,9 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 	// Verify the pair now so a bad endpoint or key surfaces at creation time
 	// rather than on the first turn. A keyless service is allowed.
 	key := strings.TrimSpace(body.APIKey)
-	if key != "" {
+	if key != "" || len(headers) > 0 {
 		client, err := llm.New(llm.Options{
-			Kind: "openai-compatible", BaseURL: baseURL, APIKey: key,
+			Kind: "openai-compatible", BaseURL: baseURL, APIKey: key, Headers: headers,
 			ProviderID: id, Timeout: 30 * time.Second,
 		})
 		if err != nil {
@@ -295,7 +306,7 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg.Providers[id] = config.Provider{
-		Kind: "openai-compatible", BaseURL: baseURL, APIKey: key,
+		Kind: "openai-compatible", BaseURL: baseURL, APIKey: key, Headers: headers,
 		Enabled: true, Label: name,
 	}
 	if err := config.Save(cfg); err != nil {
