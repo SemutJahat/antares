@@ -33,6 +33,7 @@ type Config struct {
 	Security      Security            `yaml:"security" json:"security"`
 	OSINT         OSINT               `yaml:"osint" json:"osint"`
 	ImageGen      ImageGen            `yaml:"image_gen" json:"image_gen"`
+	VideoGen      VideoGen            `yaml:"video_gen" json:"video_gen"`
 	Cron          Cron                `yaml:"cron" json:"cron"`
 	Autopilot     Autopilot           `yaml:"autopilot" json:"autopilot"`
 	Gateway       Gateway             `yaml:"gateway" json:"gateway"`

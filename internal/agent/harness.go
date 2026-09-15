@@ -109,6 +109,12 @@ func (r *repeatTracker) record(calls []llm.ToolCall) []string {
 }
 
 func processObservation(c llm.ToolCall) bool {
+	if c.Name == "content_creator" {
+		var args struct {
+			Action string `json:"action"`
+		}
+		return json.Unmarshal([]byte(c.Arguments), &args) == nil && args.Action == "poll_video"
+	}
 	if c.Name != "process" {
 		return false
 	}

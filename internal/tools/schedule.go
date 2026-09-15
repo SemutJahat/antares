@@ -28,11 +28,16 @@ func (scheduleTool) Description() string {
 
 func (scheduleTool) Schema() map[string]any {
 	return schema(map[string]any{
-		"action":   propEnum("What to do.", "list", "add", "remove"),
-		"name":     prop("string", "For add: a short name for the job."),
-		"schedule": prop("string", "For add: a 5-field cron expression (e.g. \"0 8 * * *\") or @daily/@hourly/@weekly."),
-		"prompt":   prop("string", "For add: the task to run each time, written to stand alone."),
-		"id":       prop("string", "For remove: the job id."),
+		"action":             propEnum("What to do.", "list", "add", "remove"),
+		"name":               prop("string", "For add: a short name for the job."),
+		"schedule":           prop("string", "For add: a 5-field cron expression (e.g. \"0 8 * * *\") or @daily/@hourly/@weekly."),
+		"prompt":             prop("string", "For add: the task to run each time, written to stand alone."),
+		"id":                 prop("string", "For add (optional, upsert existing): the job id. For remove: the job id."),
+		"role":               prop("string", "Optional. A specialist role to run the job as (e.g. content-creator, coder). Empty runs as the general assistant."),
+		"workspace":          prop("string", "Optional. Working directory the scheduled run should operate in."),
+		"content_project_id": prop("string", "Optional. For content-creator jobs, the persisted content project this job targets."),
+		"content_stage":      propEnum("Optional. For content-creator jobs, the pipeline stage to run.", "research", "plan", "produce", "publish", "full"),
+		"publish_mode":       propEnum("Optional. For content-creator jobs, whether the publish stage may actually post (auto) or must stop at a review-ready draft.", "draft", "auto"),
 	}, "action")
 }
 
@@ -41,11 +46,16 @@ func (scheduleTool) RequiresApproval() bool { return true }
 
 func (scheduleTool) Execute(ctx context.Context, in Input) Result {
 	var args struct {
-		Action   string `json:"action"`
-		Name     string `json:"name"`
-		Schedule string `json:"schedule"`
-		Prompt   string `json:"prompt"`
-		ID       string `json:"id"`
+		Action           string `json:"action"`
+		Name             string `json:"name"`
+		Schedule         string `json:"schedule"`
+		Prompt           string `json:"prompt"`
+		ID               string `json:"id"`
+		Role             string `json:"role"`
+		Workspace        string `json:"workspace"`
+		ContentProjectID string `json:"content_project_id"`
+		ContentStage     string `json:"content_stage"`
+		PublishMode      string `json:"publish_mode"`
 	}
 	if err := in.Bind(&args); err != nil {
 		return Errorf("%v", err)
@@ -79,9 +89,25 @@ func (scheduleTool) Execute(ctx context.Context, in Input) Result {
 		}
 		return Text(b.String())
 
-	case "add", "new":
-		if strings.TrimSpace(args.Name) == "" || strings.TrimSpace(args.Schedule) == "" || strings.TrimSpace(args.Prompt) == "" {
-			return Errorf("name, schedule, and prompt are all required to add a job")
+	case "add", "new", "upsert":
+		if strings.TrimSpace(args.Name) == "" || strings.TrimSpace(args.Schedule) == "" {
+			return Errorf("name and schedule are required to add a job")
+		}
+		role := strings.TrimSpace(args.Role)
+		stage := strings.ToLower(strings.TrimSpace(args.ContentStage))
+		projectID := strings.TrimSpace(args.ContentProjectID)
+		publishMode := strings.ToLower(strings.TrimSpace(args.PublishMode))
+		if strings.TrimSpace(args.Prompt) == "" && role == "" {
+			return Errorf("prompt is required unless a role is set")
+		}
+		if stage != "" && !validContentStage(stage) {
+			return Errorf("content_stage %q is not one of research|plan|produce|publish|full", args.ContentStage)
+		}
+		if publishMode != "" && publishMode != "draft" && publishMode != "auto" {
+			return Errorf("publish_mode %q is not draft or auto", args.PublishMode)
+		}
+		if (stage != "" || projectID != "" || publishMode != "") && role == "" {
+			role = "content-creator"
 		}
 		loc := time.Local
 		if in.Deps.Config != nil {
@@ -96,10 +122,32 @@ func (scheduleTool) Execute(ctx context.Context, in Input) Result {
 			return Errorf("invalid schedule %q: %v", args.Schedule, err)
 		}
 		now := time.Now()
-		job := &store.CronJob{
-			ID: "cron_" + randHex(6), Name: args.Name, Schedule: args.Schedule, Prompt: args.Prompt,
-			Enabled: true, NextRun: &next, CreatedAt: now, UpdatedAt: now,
+		id := strings.TrimSpace(args.ID)
+		var existing *store.CronJob
+		if id != "" {
+			if got, err := db.GetCronJob(ctx, id); err == nil {
+				existing = got
+			}
 		}
+		var job *store.CronJob
+		if existing != nil {
+			job = existing
+			job.Name = args.Name
+			job.Schedule = args.Schedule
+			job.Prompt = args.Prompt
+			job.Enabled = true
+			job.NextRun = &next
+			job.UpdatedAt = now
+		} else {
+			if id == "" {
+				id = "cron_" + randHex(6)
+			}
+			job = &store.CronJob{
+				ID: id, Name: args.Name, Schedule: args.Schedule, Prompt: args.Prompt,
+				Enabled: true, NextRun: &next, CreatedAt: now, UpdatedAt: now,
+			}
+		}
+		mergeCronMeta(job, role, strings.TrimSpace(args.Workspace), projectID, stage, publishMode)
 		if err := db.PutCronJob(ctx, job); err != nil {
 			return Errorf("%v", err)
 		}
@@ -117,6 +165,37 @@ func (scheduleTool) Execute(ctx context.Context, in Input) Result {
 	default:
 		return Errorf("unknown action %q (want list, add, or remove)", args.Action)
 	}
+}
+
+// mergeCronMeta preserves prior Meta and overwrites only the fields the caller
+// explicitly supplied. Empty strings delete their key so callers can clear a
+// value on update; nil Meta is initialised on demand.
+func mergeCronMeta(job *store.CronJob, role, workspace, projectID, stage, publishMode string) {
+	if job.Meta == nil {
+		job.Meta = store.Meta{}
+	}
+	setOrDelete := func(key, value string) {
+		if value == "" {
+			delete(job.Meta, key)
+			return
+		}
+		job.Meta[key] = value
+	}
+	if role != "" {
+		job.Meta["role"] = role
+	}
+	setOrDelete("workspace", workspace)
+	setOrDelete("content_project_id", projectID)
+	setOrDelete("content_stage", stage)
+	setOrDelete("publish_mode", publishMode)
+}
+
+func validContentStage(s string) bool {
+	switch s {
+	case "research", "plan", "produce", "publish", "full":
+		return true
+	}
+	return false
 }
 
 func randHex(n int) string {

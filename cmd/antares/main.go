@@ -20,6 +20,7 @@ import (
 	"github.com/enowdev/antares/internal/agent"
 	"github.com/enowdev/antares/internal/commands"
 	"github.com/enowdev/antares/internal/config"
+	"github.com/enowdev/antares/internal/creator"
 	"github.com/enowdev/antares/internal/cron"
 	"github.com/enowdev/antares/internal/gateway"
 	"github.com/enowdev/antares/internal/httpshim"
@@ -496,30 +497,188 @@ func (rt *runtimeServices) commandDeps() commands.Deps {
 	}
 }
 
-// runCronJob executes a scheduled prompt in its own throwaway session.
-func (rt *runtimeServices) runCronJob(ctx context.Context, job store.CronJob) (string, string, error) {
-	var reply strings.Builder
-	sessionID := ""
-	res, err := rt.agent.Run(ctx, agent.Request{
-		Message:     job.Prompt,
+// runCronJob executes a scheduled prompt in its own throwaway session. The
+// job's Meta drives which specialist runs (role), where it runs (workspace),
+// and — for content-creator schedules — which project and pipeline stage it
+// operates on. Missing prompt for a role-bound job is fine: the SystemExtra
+// below tells the specialist exactly what its stage owes.
+func (rt *runtimeServices) runCronJob(ctx context.Context, job store.CronJob) (resultSession, resultReply string, resultErr error) {
+	role, _ := job.Meta["role"].(string)
+	workspace, _ := job.Meta["workspace"].(string)
+	projectID, _ := job.Meta["content_project_id"].(string)
+	stage, _ := job.Meta["content_stage"].(string)
+	publishMode, _ := job.Meta["publish_mode"].(string)
+	role = strings.TrimSpace(role)
+	workspace = strings.TrimSpace(workspace)
+	projectID = strings.TrimSpace(projectID)
+	stage = strings.ToLower(strings.TrimSpace(stage))
+	publishMode = strings.ToLower(strings.TrimSpace(publishMode))
+
+	// Assign stage/publishMode defaults early so WithRun, SystemExtra, and
+	// the derived prompt all see the same effective values. An empty string
+	// on the context would silently escape the tool guard.
+	if role == "content-creator" && (projectID != "" || stage != "") {
+		if stage == "" {
+			stage = "full"
+		}
+		if publishMode == "" {
+			publishMode = "draft"
+		}
+	}
+
+	// Draft publish is a no-op stage: refuse it at the scheduler rather
+	// than spin up a session, prepare a run, and claim success on nothing.
+	if role == "content-creator" && stage == "publish" && publishMode == "draft" {
+		return "", "", fmt.Errorf("content-creator publish stage in draft mode is a no-op; use publish_mode=auto or run a different stage")
+	}
+
+	message := job.Prompt
+	if strings.TrimSpace(message) == "" {
+		message = defaultCronMessage(role, stage, projectID, publishMode)
+	}
+	systemExtra := cronSystemExtra(job.Name, role, stage, publishMode, projectID)
+
+	sessionID := "ses_creator_" + randHex(8)
+
+	// Content-creator jobs bind to a project directory and reserve a run
+	// against the creator service. Validate the project up front (before
+	// spending a session on Prepare) and default the workspace to the
+	// project's own directory so view_image/read_file/browser upload can
+	// see the generated assets under the write confinement.
+	var creatorSvc *creator.Service
+	if role == "content-creator" && projectID != "" {
+		creatorSvc = creator.New(rt.db, config.Path("content-creator"))
+		if _, err := creatorSvc.Get(ctx, projectID); err != nil {
+			return sessionID, "", fmt.Errorf("content creator project %s: %w", projectID, err)
+		}
+		if workspace == "" {
+			workspace = config.Path("content-creator", projectID)
+		}
+	}
+
+	runCtx := ctx
+	if role == "content-creator" && (projectID != "" || stage != "") {
+		runCtx = creator.WithRun(ctx, projectID, stage, publishMode, sessionID)
+	}
+
+	prepared, err := rt.agent.Prepare(runCtx, agent.Request{
+		SessionID:   sessionID,
+		Message:     message,
 		Platform:    "cron",
-		SystemExtra: "You are running unattended on a schedule named " + job.Name + ". Nobody can answer follow-up questions, so make reasonable assumptions and finish the task.",
-	}, func(e agent.Event) error {
+		Role:        role,
+		Workspace:   workspace,
+		SystemExtra: systemExtra,
+	})
+	if err != nil {
+		return sessionID, "", err
+	}
+
+	if creatorSvc != nil {
+		if _, err := creatorSvc.BeginRun(runCtx, projectID, stage, publishMode, sessionID); err != nil {
+			prepared.Close()
+			return sessionID, "", err
+		}
+	}
+
+	var reply strings.Builder
+	var runErr error
+	// EndRun and the social lease MUST always release, even on panic or on
+	// runCtx cancellation. Use WithoutCancel + a short deadline so a
+	// cancelled parent context cannot skip cleanup.
+	defer func() {
+		if creatorSvc != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			p, err := creatorSvc.EndRun(cleanupCtx, projectID, sessionID, runErr)
+			if err != nil {
+				resultErr = err
+			} else if resultErr == nil && p.RunStatus == "error" {
+				resultErr = errors.New(p.LastRunError)
+			}
+		}
+		if rt.social != nil {
+			rt.social.Release(sessionID)
+		}
+	}()
+
+	res, err := prepared.Run(func(e agent.Event) error {
 		switch e.Type {
-		case agent.EventSession:
-			sessionID = e.ID
 		case agent.EventText:
 			reply.WriteString(e.Delta)
 		}
 		return nil
 	})
-	if err != nil {
-		return sessionID, "", err
+	runErr = err
+	if runErr != nil {
+		return sessionID, "", runErr
 	}
 	if res != nil && res.Reply != "" {
 		return sessionID, res.Reply, nil
 	}
 	return sessionID, reply.String(), nil
+}
+
+// defaultCronMessage synthesises the user-facing message for a role-bound job
+// where the caller left prompt blank — the UI-happy path when scheduling a
+// content-creator stage.
+func defaultCronMessage(role, stage, projectID, publishMode string) string {
+	if role == "content-creator" && projectID != "" {
+		s := stage
+		if s == "" {
+			s = "full"
+		}
+		mode := publishMode
+		if mode == "" {
+			mode = "draft"
+		}
+		return "Run the " + s + " stage of content-creator project " + projectID +
+			" in " + mode + " mode. Follow the stage instructions in your system prompt exactly."
+	}
+	if role != "" {
+		return "Run your scheduled routine as the " + role + " specialist."
+	}
+	return "Run your scheduled routine."
+}
+
+// cronSystemExtra spells out the unattended contract and, for a
+// content-creator run, exactly which pipeline stages are and are not allowed.
+// The prompt is the last line of defence — the content_creator tool and the
+// per-tool cron guard reject the same actions structurally.
+func cronSystemExtra(name, role, stage, publishMode, projectID string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "You are running unattended on a schedule named %s. Nobody can answer follow-up questions, so make reasonable assumptions and finish the task. If a step requires human approval or credentials you cannot obtain unattended, stop and report why — do not wait, do not ask, and do not bypass approval checks.", name)
+	if role == "content-creator" && (projectID != "" || stage != "") {
+		s := stage
+		if s == "" {
+			s = "full"
+		}
+		mode := publishMode
+		if mode == "" {
+			mode = "draft"
+		}
+		fmt.Fprintf(&b, "\n\nActive content-creator run:\n- project_id: %s\n- stage: %s\n- publish_mode: %s\n", projectID, s, mode)
+		switch s {
+		case "research":
+			b.WriteString("Do research only: observe live sources, record trends with URL/title/observed_at (and metrics only if you actually saw them), refine ideas. Do NOT generate any references, keyframes, videos, or publish. Do NOT call prepare_publish or confirm_publish.")
+		case "plan":
+			b.WriteString("Plan only: pick the selected idea, write reference briefs and the ordered shot list on the project. Do NOT generate references, keyframes, or videos. Do NOT call prepare_publish or confirm_publish.")
+		case "produce":
+			b.WriteString("Produce only: generate approved references, then keyframes, then video jobs; poll and download; inspect keyframes and last frames before continuing; assemble the final cut. Do NOT publish. Do NOT call prepare_publish or confirm_publish.")
+		case "publish":
+			if mode == "auto" {
+				b.WriteString("Publish stage in auto mode: call prepare_publish, then drive the social browser to upload to the project's account, then call confirm_publish with the actual verified post URL. If any step blocks (auth expired, upload rejected, no post URL) call block_publish with the reason — never fabricate a post URL, never mark published without one.")
+			} else {
+				b.WriteString("Publish stage in draft mode: this is a no-op. Do NOT call prepare_publish, do NOT call confirm_publish, and do NOT drive any upload. Report that draft mode disables the publish stage and stop.")
+			}
+		case "full":
+			if mode == "auto" {
+				b.WriteString("Full pipeline in auto mode: research -> plan -> produce -> publish end-to-end. In the publish step, upload via the social browser and confirm_publish with the verified post URL, or block_publish with the reason. Never fabricate a post URL.")
+			} else {
+				b.WriteString("Full pipeline in draft mode: research -> plan -> produce -> assemble the final MP4, then STOP. Do NOT call prepare_publish, confirm_publish, or drive any upload. Leave the assembled MP4 for the operator to review.")
+			}
+		}
+	}
+	return b.String()
 }
 
 // reload re-reads config and rebuilds config-dependent services in place.

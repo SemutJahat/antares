@@ -26,6 +26,7 @@ func init() {
 		addIntelTool{},
 		methodologyStatusTool{},
 		imageGenerateTool{},
+		contentCreatorTool{},
 		visionTool{},
 		speakTool{},
 		transcribeTool{},

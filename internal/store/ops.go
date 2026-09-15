@@ -84,7 +84,7 @@ func (s *sqlStore) PutCronRun(ctx context.Context, r *CronRun) error {
 	}
 	_, err := s.exec(ctx, `INSERT INTO cron_runs (id,job_id,status,output,error,session_id,started_at,finished_at)
 		VALUES (?,?,?,?,?,?,?,?)`+
-		onConflict("id", "status=EXCLUDED.status, output=EXCLUDED.output, error=EXCLUDED.error, finished_at=EXCLUDED.finished_at"),
+		onConflict("id", "status=EXCLUDED.status, output=EXCLUDED.output, error=EXCLUDED.error, session_id=EXCLUDED.session_id, finished_at=EXCLUDED.finished_at"),
 		r.ID, r.JobID, r.Status, r.Output, r.Error, r.SessionID, ms(r.StartedAt), msPtr(r.FinishedAt))
 	return err
 }

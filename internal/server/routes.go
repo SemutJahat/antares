@@ -25,6 +25,17 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/chat/attach", s.handleChatAttach)
 	m.HandleFunc("POST /api/chat/interrupt", s.handleInterrupt)
 
+	m.HandleFunc("GET /api/content-creator/projects", s.handleCreatorList)
+	m.HandleFunc("POST /api/content-creator/projects", s.handleCreatorCreate)
+	m.HandleFunc("GET /api/content-creator/projects/{id}", s.handleCreatorGet)
+	m.HandleFunc("PUT /api/content-creator/projects/{id}", s.handleCreatorUpdate)
+	m.HandleFunc("POST /api/content-creator/projects/{id}/action", s.handleCreatorAction)
+	m.HandleFunc("POST /api/content-creator/projects/{id}/run", s.handleCreatorRun)
+	m.HandleFunc("POST /api/content-creator/projects/{id}/reconcile", s.handleCreatorReconcile)
+	m.HandleFunc("GET /api/content-creator/projects/{id}/artifact", s.handleCreatorArtifact)
+	m.HandleFunc("GET /api/content-creator/settings", s.handleCreatorSettings)
+	m.HandleFunc("POST /api/content-creator/settings", s.handleCreatorSaveSettings)
+
 	// Intercept proxy
 	m.HandleFunc("GET /api/intercept/status", s.handleInterceptStatus)
 	m.HandleFunc("POST /api/intercept/start", s.handleInterceptStart)

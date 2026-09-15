@@ -24,6 +24,8 @@ const en = {
   'nav.skills': 'Skills',
   'nav.roles': 'Roles',
   'nav.soul': 'Soul',
+  'creator.title': 'Content Creator',
+  'creator.desc': 'Plan, generate, assemble, and publish videos with consistent characters and settings.',
   'soul.title': 'Soul',
   'soul.desc': 'Your agent’s identity — its name, personality, and voice (SOUL.md).',
   'soul.unsetHint': 'No identity yet. Your agent will ask who it should be at the start of its next conversation — or you can write it here directly.',

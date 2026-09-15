@@ -120,19 +120,58 @@ func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateCron(w http.ResponseWriter, r *http.Request) {
 	var body struct {
+		ID       string `json:"id"`
 		Name     string `json:"name"`
 		Schedule string `json:"schedule"`
 		Prompt   string `json:"prompt"`
 		Target   string `json:"target"`
 		Timezone string `json:"timezone"`
+		// Meta fields the UI or agent may attach. Accepted at the top level
+		// for convenience and inside a nested "meta" object for symmetry with
+		// the GET response. Empty strings preserve any prior value on upsert.
+		Role             string `json:"role"`
+		Workspace        string `json:"workspace"`
+		ContentProjectID string `json:"content_project_id"`
+		ContentStage     string `json:"content_stage"`
+		PublishMode      string `json:"publish_mode"`
+		Meta             struct {
+			Role             string `json:"role"`
+			Workspace        string `json:"workspace"`
+			ContentProjectID string `json:"content_project_id"`
+			ContentStage     string `json:"content_stage"`
+			PublishMode      string `json:"publish_mode"`
+		} `json:"meta"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if strings.TrimSpace(body.Name) == "" || strings.TrimSpace(body.Prompt) == "" {
-		writeError(w, http.StatusBadRequest, errors.New("name and prompt are required"))
+	if strings.TrimSpace(body.Name) == "" {
+		writeError(w, http.StatusBadRequest, errors.New("name is required"))
 		return
+	}
+	// Meta wins if provided; otherwise the flat fields.
+	role := firstNonEmpty(body.Meta.Role, body.Role)
+	workspace := firstNonEmpty(body.Meta.Workspace, body.Workspace)
+	projectID := firstNonEmpty(body.Meta.ContentProjectID, body.ContentProjectID)
+	stage := strings.ToLower(strings.TrimSpace(firstNonEmpty(body.Meta.ContentStage, body.ContentStage)))
+	publishMode := strings.ToLower(strings.TrimSpace(firstNonEmpty(body.Meta.PublishMode, body.PublishMode)))
+	// A creator-linked job derives its prompt from stage/project at run time
+	// when the caller left prompt blank; still require prompt for plain jobs.
+	if strings.TrimSpace(body.Prompt) == "" && strings.TrimSpace(role) == "" {
+		writeError(w, http.StatusBadRequest, errors.New("prompt is required for jobs without a role"))
+		return
+	}
+	if stage != "" && !validContentStage(stage) {
+		writeError(w, http.StatusBadRequest, errors.New("content_stage must be research|plan|produce|publish|full"))
+		return
+	}
+	if publishMode != "" && publishMode != "draft" && publishMode != "auto" {
+		writeError(w, http.StatusBadRequest, errors.New("publish_mode must be draft or auto"))
+		return
+	}
+	if (stage != "" || projectID != "" || publishMode != "") && strings.TrimSpace(role) == "" {
+		role = "content-creator"
 	}
 	loc := time.Local
 	if s.cron != nil {
@@ -144,10 +183,33 @@ func (s *Server) handleCreateCron(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job := &store.CronJob{
-		ID: newID("job"), Name: body.Name, Schedule: body.Schedule, Prompt: body.Prompt,
-		Enabled: true, Target: body.Target, Timezone: body.Timezone, Meta: store.Meta{},
+	// Upsert path: an explicit id preserves prior Meta and CreatedAt so an
+	// edit from the UI does not silently drop unrelated metadata attached by
+	// the agent or a prior save.
+	var job *store.CronJob
+	if id := strings.TrimSpace(body.ID); id != "" {
+		if existing, err := s.db.GetCronJob(r.Context(), id); err == nil {
+			job = existing
+			job.Name = body.Name
+			job.Schedule = body.Schedule
+			job.Prompt = body.Prompt
+			job.Enabled = true
+			job.Target = body.Target
+			job.Timezone = body.Timezone
+		} else {
+			job = &store.CronJob{ID: id}
+		}
 	}
+	if job == nil {
+		job = &store.CronJob{
+			ID: newID("job"), Name: body.Name, Schedule: body.Schedule, Prompt: body.Prompt,
+			Enabled: true, Target: body.Target, Timezone: body.Timezone,
+		}
+	}
+	if job.Meta == nil {
+		job.Meta = store.Meta{}
+	}
+	mergeCronMetaFields(job, strings.TrimSpace(role), strings.TrimSpace(workspace), strings.TrimSpace(projectID), stage, publishMode)
 	if !next.IsZero() {
 		job.NextRun = &next
 	}
@@ -156,6 +218,39 @@ func (s *Server) handleCreateCron(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// mergeCronMetaFields applies caller-supplied Meta values. Empty strings clear
+// their key so the UI can remove a field on edit; role is only overwritten
+// when explicitly provided so blank leaves the prior role untouched.
+func mergeCronMetaFields(job *store.CronJob, role, workspace, projectID, stage, publishMode string) {
+	if job.Meta == nil {
+		job.Meta = store.Meta{}
+	}
+	set := func(key, value string) {
+		if value == "" {
+			delete(job.Meta, key)
+			return
+		}
+		job.Meta[key] = value
+	}
+	if role != "" {
+		job.Meta["role"] = role
+	}
+	set("workspace", workspace)
+	set("content_project_id", projectID)
+	set("content_stage", stage)
+	set("publish_mode", publishMode)
+}
+
+// validContentStage is duplicated from internal/tools to keep the server free
+// of a tool-package import; the enum is short and unlikely to grow.
+func validContentStage(s string) bool {
+	switch s {
+	case "research", "plan", "produce", "publish", "full":
+		return true
+	}
+	return false
 }
 
 func (s *Server) handleToggleCron(w http.ResponseWriter, r *http.Request) {

@@ -16,6 +16,24 @@ antares cron run <id>        # run it now
 antares cron rm <id>
 ```
 
+## Specialist and Content Creator jobs
+
+The `schedule` tool and `POST /api/cron/jobs` accept `role` and `workspace`.
+Content Creator jobs additionally accept `content_project_id`, `content_stage`
+(`research`, `plan`, `produce`, `publish`, `full`), and `publish_mode`
+(`draft` or `auto`). These values are retained in job metadata and passed to the
+actual agent run, not just included in the job title. The Content Creator page
+sets them when you schedule a project stage.
+
+Research and planning do not generate media or publish. Production stops at a
+final draft. Publishing requires explicit `auto` authorization. A scheduled
+action requiring interactive approval fails with a blocked explanation instead
+of waiting for a person. Configure unattended tool approval deliberately; the
+scheduler does not bypass the existing approval policy.
+
+Each creator run records its chat session ID and persists progress on the
+project. An unfinished stage reports an error even if the model returned prose.
+
 ## Expressions
 
 Standard five fields — minute, hour, day of month, month, day of week:

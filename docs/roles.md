@@ -33,12 +33,42 @@ work needs and no more. `list_roles` lets the model discover them.
 | `data-analyst` | Exploring data, running queries, reporting the numbers |
 | `researcher` | Investigating with sources |
 | `writer` | Clear prose |
+| `content-creator` | Research, plan, generate connected video shots, assemble, and publish using existing social accounts |
 | `security-recon` | Mapping an authorized target's attack surface |
 | `security-webapp` | Testing an authorized web app against OWASP |
 | `security-api` | Testing an authorized API |
 | `security-report` | Turning findings into a report |
 | `threat-modeler` | Reasoning about how a system could be attacked |
 | `incident-responder` | Investigating logs and evidence after an incident |
+
+## Content Creator
+
+Open **Content Creator** in the dashboard, or select `/role content-creator`.
+Each video project stores its brief, source evidence, ideas, visual references,
+ordered shots, provider job IDs, generated artifacts, and publication record.
+Reference images guide each new composition; continuation shots reuse the
+previous clip's exact last frame. References improve consistency but do not
+guarantee it, so inspect generated keyframes and clips before publishing.
+
+Configure image and video endpoints in the page's **Models** tab. The image
+adapter uses OpenAI-compatible `/images/generations` and `/images/edits`; the
+video adapter uses `/videos`, `/videos/{id}`, and `/videos/{id}/content`.
+The defaults are `gpt-image-1` and `sora-2`, both disabled until configured.
+Custom endpoints must implement those protocols; arbitrary video APIs are not
+interchangeable. Clip durations and supported sizes depend on the selected model.
+Install `ffmpeg` and `ffprobe` for last-frame extraction and final MP4 assembly.
+
+Use the **Schedule** tab for research, plan, produce, publish, or full runs.
+Draft mode never uploads. Publishing requires explicit authorization, an existing
+connected Social Media account, and its persistent browser login. The agent
+uploads through that browser and records an observed post URL; it does not create
+another credential store. An uncertain upload stays blocked until reconciled,
+preventing a disconnected retry from publishing the same video twice.
+
+Generated media lives under `~/.antares/content-creator/<project-id>/`; metadata
+lives in the existing database. Poll an existing job rather than resubmitting it.
+Reset clears selected generated assets and dependent clips with explicit operator
+confirmation. A provider change does not migrate already-submitted jobs.
 
 ## Writing your own
 

@@ -6,6 +6,7 @@ import {
   Database,
   FileText,
   Fingerprint,
+  FilmStrip,
   Gear,
   GlobeHemisphereWest,
   HardDrives,
@@ -138,6 +139,10 @@ const RUNTIME_BY_ID: Record<string, RouteRuntime> = {
     icon: Robot,
     component: lazy(() => import('@/pages/SystemPage')),
   },
+  'content-creator': {
+    icon: FilmStrip,
+    component: lazy(() => import('@/pages/ContentCreatorPage')),
+  },
   'social-media': {
     icon: ShareNetwork,
     component: lazy(() => import('@/pages/SocialMediaPage')),
@@ -167,6 +172,7 @@ export const NAV_LABELS: Record<string, MessageKey> = {
   '/memory': 'nav.memory',
   '/skills': 'nav.skills',
   '/roles': 'nav.roles',
+  '/content-creator': 'creator.title',
   '/soul': 'nav.soul',
   '/cron': 'nav.cron',
   '/channels': 'nav.channels',

@@ -1,36 +1,44 @@
 package tools
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/enowdev/antares/internal/config"
+	"github.com/enowdev/antares/internal/media"
 )
 
 // imageGenerateTool turns a prompt into an image via an OpenAI-compatible
-// images endpoint, and saves the result to disk.
+// images endpoint, and saves the result to disk. When reference_paths are
+// supplied it uses /images/edits so the model composes the new image with
+// the supplied references as visual guidance; otherwise it uses
+// /images/generations for a plain text-to-image call.
 type imageGenerateTool struct{}
 
 func (imageGenerateTool) Name() string { return "image_generate" }
 
 func (imageGenerateTool) Description() string {
 	return "Generate an image from a text prompt and save it to a file. Describe what you want in detail — " +
-		"the subject, the style, the composition. Returns the path to the saved image."
+		"the subject, the style, the composition. Optionally pass reference_paths to reuse existing characters, " +
+		"settings or styles. Returns the path to the saved image."
 }
 
 func (imageGenerateTool) Schema() map[string]any {
 	return schema(map[string]any{
 		"prompt": prop("string", "A detailed description of the image to generate."),
-		"size":   propEnum("The image size.", "1024x1024", "1792x1024", "1024x1792"),
+		// A free-form string so custom models with non-DALLE dimensions
+		// (e.g. gpt-image-1 / gpt-image-2 arbitrary WxH) still work. The
+		// media backend validates the value against the provider.
+		"size": prop("string", "The image size as WIDTHxHEIGHT (e.g. 1024x1024, 720x1280). Defaults to the configured image_gen.size."),
+		"reference_paths": map[string]any{
+			"type":        "array",
+			"description": "Optional local image paths to feed as references. When present, the edit endpoint is used so the result stays visually consistent with the references. Paths are resolved inside the current session's workspace or write roots.",
+			"items":       map[string]any{"type": "string"},
+		},
 	}, "prompt")
 }
 
@@ -38,8 +46,9 @@ func (imageGenerateTool) RequiresApproval() bool { return true }
 
 func (imageGenerateTool) Execute(ctx context.Context, in Input) Result {
 	var args struct {
-		Prompt string `json:"prompt"`
-		Size   string `json:"size"`
+		Prompt         string   `json:"prompt"`
+		Size           string   `json:"size"`
+		ReferencePaths []string `json:"reference_paths"`
 	}
 	if err := in.Bind(&args); err != nil {
 		return Errorf("%v", err)
@@ -50,92 +59,34 @@ func (imageGenerateTool) Execute(ctx context.Context, in Input) Result {
 	if in.Deps == nil || in.Deps.Config == nil {
 		return Errorf("image generation is not configured")
 	}
-	cfg := in.Deps.Config.ImageGen
-	if !cfg.Enabled {
-		return Errorf("image generation is switched off (image_gen.enabled = false)")
-	}
 
-	// Resolve the endpoint and key: an explicit image-gen config, or borrow a
-	// named provider's, or fall back to OpenAI's.
-	base, key, model := cfg.BaseURL, cfg.APIKey, cfg.Model
-	if base == "" || key == "" {
-		id := cfg.Provider
-		if id == "" {
-			id = "openai"
-		}
-		if p, ok := in.Deps.Config.Providers[id]; ok {
-			if base == "" {
-				base = p.BaseURL
-			}
-			if key == "" {
-				key = p.APIKey
-			}
-		}
-	}
-	if base == "" {
-		base = "https://api.openai.com/v1"
-	}
-	if key == "" {
-		return Errorf("no API key for image generation — set image_gen.api_key or configure the provider")
-	}
-	if model == "" {
-		model = "gpt-image-1"
-	}
-	size := args.Size
-	if size == "" {
-		size = firstNonBlank(cfg.Size, "1024x1024")
-	}
-
-	in.Emit(Progress{Tool: "image_generate", Message: "generating…"})
-
-	body, _ := json.Marshal(map[string]any{
-		"model": model, "prompt": args.Prompt, "size": size, "n": 1,
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimRight(base, "/")+"/images/generations", bytes.NewReader(body))
+	ep, err := media.ImageEndpoint(in.Deps.Config)
 	if err != nil {
 		return Errorf("%v", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+key)
-
-	client := &http.Client{Timeout: 180 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return Errorf("could not reach the image endpoint: %v", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if resp.StatusCode != http.StatusOK {
-		return Errorf("the image endpoint returned %s: %s", resp.Status, truncateTool(string(raw), 400))
+	size := args.Size
+	if size == "" {
+		size = firstNonBlank(in.Deps.Config.ImageGen.Size, "1024x1024")
 	}
 
-	var out struct {
-		Data []struct {
-			B64 string `json:"b64_json"`
-			URL string `json:"url"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil || len(out.Data) == 0 {
-		return Errorf("the image endpoint returned nothing usable")
-	}
-
-	var img []byte
-	switch {
-	case out.Data[0].B64 != "":
-		img, err = base64.StdEncoding.DecodeString(out.Data[0].B64)
-		if err != nil {
-			return Errorf("could not decode the image: %v", err)
+	// Resolve every reference against the session's read boundary so an
+	// arbitrary "/etc/passwd" or "../.ssh/id_rsa" cannot slip in as a
+	// reference and be base64-uploaded to the provider.
+	confinedRefs := make([]string, 0, len(args.ReferencePaths))
+	for _, p := range args.ReferencePaths {
+		if strings.TrimSpace(p) == "" {
+			continue
 		}
-	case out.Data[0].URL != "":
-		img, err = fetchBytes(ctx, out.Data[0].URL)
+		resolved, err := resolveRead(in, p)
 		if err != nil {
-			return Errorf("could not download the image: %v", err)
+			return Errorf("reference %q: %v", p, err)
 		}
-	default:
-		return Errorf("the image endpoint returned neither data nor a url")
+		confinedRefs = append(confinedRefs, resolved)
 	}
 
+	// Output is a write. In an ordinary session it lands in the workspace's
+	// .antares/images; in a project session that path is inside WriteRoots.
+	// Fall back to the antares home when we have no workspace at all.
 	dir := filepath.Join(config.Home(), "images")
 	if in.Workspace != "" {
 		if info, err := os.Stat(in.Workspace); err == nil && info.IsDir() {
@@ -146,28 +97,18 @@ func (imageGenerateTool) Execute(ctx context.Context, in Input) Result {
 		return Errorf("%v", err)
 	}
 	path := filepath.Join(dir, fmt.Sprintf("image-%d.png", time.Now().UnixMilli()))
-	if err := os.WriteFile(path, img, 0o644); err != nil {
+
+	in.Emit(Progress{Tool: "image_generate", Message: "generating…"})
+	if err := media.GenerateImage(ctx, ep, args.Prompt, size, confinedRefs, path); err != nil {
 		return Errorf("%v", err)
 	}
+	info, _ := os.Stat(path)
+	var bytes int64
+	if info != nil {
+		bytes = info.Size()
+	}
 	return Result{
-		Content: fmt.Sprintf("Generated an image and saved it to %s (%d KB).", path, len(img)/1024),
-		Meta:    map[string]any{"path": path, "bytes": len(img)},
+		Content: fmt.Sprintf("Generated an image and saved it to %s (%d KB).", path, bytes/1024),
+		Meta:    map[string]any{"path": path, "bytes": bytes},
 	}
-}
-
-// fetchBytes downloads a URL's body, bounded.
-func fetchBytes(ctx context.Context, url string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s returned %s", url, resp.Status)
-	}
-	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 }

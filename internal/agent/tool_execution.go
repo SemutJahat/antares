@@ -83,6 +83,19 @@ func (a *Agent) executeTools(
 			_ = safeEmit(Event{Type: EventToolResult, ID: call.ID, Name: call.Name, Content: outcomes[i].message.Content, IsError: true})
 			return
 		}
+		if req.Platform == "cron" {
+			mode := strings.ToLower(strings.TrimSpace(a.config().Tools.ApprovalMode))
+			needsHuman := call.Name == "ask_user" || (mode != "auto" && mode != "deny" &&
+				(tools.NeedsApproval(tool) || dangerInTool(tool, call.Arguments) != ""))
+			if needsHuman {
+				content := "Scheduled run blocked: this action requires human approval. Run it interactively or explicitly configure unattended execution."
+				outcomes[i] = toolOutcome{message: llm.Message{
+					Role: llm.RoleTool, ToolCallID: call.ID, Name: call.Name, Content: content,
+				}, isError: true}
+				_ = safeEmit(Event{Type: EventToolResult, ID: call.ID, Name: call.Name, Content: content, IsError: true})
+				return
+			}
+		}
 
 		// A subordinate run (delegated sub-agent, background task, continued
 		// sub-session) has no user watching. ask_user is dropped from its

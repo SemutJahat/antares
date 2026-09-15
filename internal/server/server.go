@@ -64,7 +64,8 @@ type Server struct {
 	// requests from both passing the setup check before either saves.
 	setupMu sync.Mutex
 	// passwordMu serializes first-password creation and password replacement.
-	passwordMu sync.Mutex
+	passwordMu      sync.Mutex
+	creatorConfigMu sync.Mutex
 }
 
 // Options configures a Server.

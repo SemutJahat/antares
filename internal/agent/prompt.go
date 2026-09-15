@@ -502,7 +502,7 @@ func (a *Agent) resolveTools(req Request) []tools.Tool {
 			// sub-session) has no user watching its stream, so exposing
 			// ask_user would let it block on the ask desk forever while
 			// the parent waits for its answer. Force it to decide.
-			if isSubordinateRun(req) {
+			if isSubordinateRun(req) || req.Platform == "cron" {
 				continue
 			}
 		}

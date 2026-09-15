@@ -12,6 +12,7 @@ import (
 
 	"github.com/enowdev/antares/internal/browser"
 	"github.com/enowdev/antares/internal/config"
+	"github.com/enowdev/antares/internal/creator"
 	"github.com/enowdev/antares/internal/textutil"
 )
 
@@ -21,7 +22,17 @@ import (
 var browserSessions = struct {
 	sync.Mutex
 	byKey map[string]*browser.Session
-	reap  sync.Once
+	// social is a single, process-wide handle attached over CDP to the
+	// persistent SocialBrowser manager's Chrome. It is not idle-reaped and
+	// not per-conversation — every session that sets session="social" shares
+	// this one attached controller so a lock held by one caller means the
+	// same physical tab another caller sees.
+	social *browser.Session
+	// socialURL is the CDP debug URL we attached the social session against.
+	// If the underlying manager stops/starts and the URL changes we drop the
+	// attached session and re-attach on next use.
+	socialURL string
+	reap      sync.Once
 }{byKey: map[string]*browser.Session{}}
 
 // sessionFor returns the browser for a conversation, creating it on first use.
@@ -67,6 +78,53 @@ func sessionFor(key string, cfg *config.Config) *browser.Session {
 	return s
 }
 
+// socialEndpoint is the optional CDP-attach interface a SocialBrowserManager
+// may satisfy. Declared locally so no shared Deps change is required and the
+// existing SocialBrowserManager interface + its mocks keep compiling
+// unchanged. Real implementation lives on socialbrowser.Manager.
+type socialEndpoint interface {
+	DebugURL() (string, error)
+	Acquire(ctx context.Context, owner string, timeout time.Duration) error
+	Release(owner string)
+	Renew(owner string) bool
+	Holder() string
+	TryReenter(owner string) bool
+}
+
+// socialSessionFor returns the process-wide CDP-attached view of the
+// persistent social browser, creating and attaching it on first use. The
+// caller MUST have coordinated with the manager's lease already (or be
+// happy to hold no lease for a one-shot read). ep is the endpoint interface
+// resolved from Deps.SocialBrowser.
+func socialSessionFor(ep socialEndpoint) (*browser.Session, string, error) {
+	debugURL, err := ep.DebugURL()
+	if err != nil {
+		return nil, "", err
+	}
+	browserSessions.Lock()
+	defer browserSessions.Unlock()
+	if browserSessions.social != nil && browserSessions.socialURL == debugURL {
+		return browserSessions.social, debugURL, nil
+	}
+	// URL changed (or first attach): drop any stale attached session and
+	// build a fresh one. Stop() is safe against a not-started session.
+	if browserSessions.social != nil {
+		browserSessions.social.Stop()
+		browserSessions.social = nil
+	}
+	s := browser.New(browser.Options{
+		// RemoteURL makes Start attach to the already-running Chrome instead
+		// of spawning a second one — this is how we drive the same profile
+		// the user is looking at, with the same login jar.
+		RemoteURL: debugURL,
+		Width:     1280,
+		Height:    800,
+	})
+	browserSessions.social = s
+	browserSessions.socialURL = debugURL
+	return s, debugURL, nil
+}
+
 func closeIdleBrowsers(idle time.Duration) {
 	browserSessions.Lock()
 	var stale []*browser.Session
@@ -90,6 +148,14 @@ func CloseBrowsers() {
 		all = append(all, s)
 		delete(browserSessions.byKey, key)
 	}
+	// The attached social session is a CDP client, not a spawned Chrome —
+	// stopping it just closes our WebSocket. The real browser lives under
+	// socialbrowser.Manager and is shut down there.
+	if s := browserSessions.social; s != nil {
+		all = append(all, s)
+		browserSessions.social = nil
+		browserSessions.socialURL = ""
+	}
 	browserSessions.Unlock()
 	for _, s := range all {
 		s.Stop()
@@ -103,12 +169,13 @@ type browserTool struct{}
 func (browserTool) Name() string { return "browser" }
 
 func (browserTool) Description() string {
-	return "Drive a real web browser: open pages, read them, click, type, and submit forms. " +
+	return "Drive a real web browser: open pages, read them, click, type, submit forms, and attach files. " +
 		"Use it for anything that needs JavaScript, a login, or a form — web_fetch is faster for plain documents.\n\n" +
 		"The usual loop is: navigate, then snapshot to see what is on the page, then click or type " +
 		"using the e-numbers the snapshot returned, then snapshot again to see what changed. " +
 		"References like e7 only stay valid until the page changes, so take a fresh snapshot after every action " +
-		"that navigates or re-renders."
+		"that navigates or re-renders.\n\n" +
+		"Pass session=\"social\" to drive the persistent social-media browser instead of a fresh one — the same login jar the user sees. Long publish flows should take an exclusive lease first via the social_browser tool's acquire action, so a concurrent agent does not steal the tab mid-run; single one-off reads can skip the lease."
 }
 
 func (browserTool) Schema() map[string]any {
@@ -116,18 +183,21 @@ func (browserTool) Schema() map[string]any {
 		"action": propEnum("What to do.",
 			"navigate", "snapshot", "click", "type", "select", "text", "screenshot",
 			"press", "scroll", "back", "wait_for", "eval", "console", "requests",
-			"tabs", "close"),
-		"url":     prop("string", "For navigate: the address to open."),
-		"ref":     prop("string", "Element reference from a snapshot, like e7."),
-		"text":    prop("string", "For type: the text to enter. For wait_for: the text to wait for. For select: the option."),
-		"submit":  propDefault("boolean", "For type: press Enter afterwards.", false),
-		"key":     prop("string", "For press: Enter, Tab, Escape, ArrowDown, or a single character."),
-		"to":      propEnum("For scroll: which way.", "down", "up", "top", "bottom", "left", "right"),
-		"amount":  propDefault("integer", "For scroll: pixels to move.", 600),
-		"script":  prop("string", "For eval: JavaScript to run in the page. Its value is returned."),
-		"full":    propDefault("boolean", "For screenshot: capture the whole page rather than the viewport.", false),
-		"max":     propDefault("integer", "Cap on elements in a snapshot, or characters of text.", 0),
-		"seconds": propDefault("integer", "For wait_for: how long to wait.", 15),
+			"tabs", "upload", "close"),
+		"url":        prop("string", "For navigate: the address to open."),
+		"ref":        prop("string", "Element reference from a snapshot, like e7."),
+		"text":       prop("string", "For type: the text to enter. For wait_for: the text to wait for. For select: the option."),
+		"submit":     propDefault("boolean", "For type: press Enter afterwards.", false),
+		"key":        prop("string", "For press: Enter, Tab, Escape, ArrowDown, or a single character."),
+		"to":         propEnum("For scroll: which way.", "down", "up", "top", "bottom", "left", "right"),
+		"amount":     propDefault("integer", "For scroll: pixels to move.", 600),
+		"script":     prop("string", "For eval: JavaScript to run in the page. Its value is returned."),
+		"full":       propDefault("boolean", "For screenshot: capture the whole page rather than the viewport.", false),
+		"max":        propDefault("integer", "Cap on elements in a snapshot, or characters of text.", 0),
+		"seconds":    propDefault("integer", "For wait_for: how long to wait.", 15),
+		"path":       prop("string", "For upload: local file path. Without project_id, resolves inside the workspace/project. With project_id, resolves inside <config-home>/content-creator/<project_id>/ only."),
+		"session":    propDefault("string", "Which browser to drive: default (per-conversation ephemeral) or \"social\" (the persistent social-media browser with saved logins).", "default"),
+		"project_id": prop("string", "For upload of a Content Creator artifact: the project id whose registered artifact directory the path is resolved against. Uploads outside this directory are refused."),
 	}, "action")
 }
 
@@ -141,18 +211,21 @@ func (browserTool) UntrustedOutput() bool { return true }
 
 func (browserTool) Execute(ctx context.Context, in Input) Result {
 	var args struct {
-		Action  string `json:"action"`
-		URL     string `json:"url"`
-		Ref     string `json:"ref"`
-		Text    string `json:"text"`
-		Submit  bool   `json:"submit"`
-		Key     string `json:"key"`
-		To      string `json:"to"`
-		Amount  int    `json:"amount"`
-		Script  string `json:"script"`
-		Full    bool   `json:"full"`
-		Max     int    `json:"max"`
-		Seconds int    `json:"seconds"`
+		Action    string `json:"action"`
+		URL       string `json:"url"`
+		Ref       string `json:"ref"`
+		Text      string `json:"text"`
+		Submit    bool   `json:"submit"`
+		Key       string `json:"key"`
+		To        string `json:"to"`
+		Amount    int    `json:"amount"`
+		Script    string `json:"script"`
+		Full      bool   `json:"full"`
+		Max       int    `json:"max"`
+		Seconds   int    `json:"seconds"`
+		Path      string `json:"path"`
+		Session   string `json:"session"`
+		ProjectID string `json:"project_id"`
 	}
 	if err := in.Bind(&args); err != nil {
 		return Errorf("%v", err)
@@ -166,15 +239,81 @@ func (browserTool) Execute(ctx context.Context, in Input) Result {
 		return Errorf("the browser tool is switched off (tools.browser.enabled = false)")
 	}
 
-	key := in.SessionID
-	if key == "" {
-		key = "default"
-	}
-	s := sessionFor(key, cfg)
 	action := strings.ToLower(strings.TrimSpace(args.Action))
+	sessionKind := strings.ToLower(strings.TrimSpace(args.Session))
+	if sessionKind == "" {
+		sessionKind = "default"
+	}
+
+	var (
+		s           *browser.Session
+		key         string
+		social      bool
+		owner       string
+		heldByOwner bool
+	)
+
+	switch sessionKind {
+	case "default":
+		key = in.SessionID
+		if key == "" {
+			key = "default"
+		}
+		s = sessionFor(key, cfg)
+
+	case "social":
+		social = true
+		if in.Deps == nil || in.Deps.SocialBrowser == nil {
+			return Errorf("social browser is not available — the social feature is not configured")
+		}
+		ep, ok := in.Deps.SocialBrowser.(socialEndpoint)
+		if !ok {
+			return Errorf("the configured social browser manager does not expose a CDP endpoint — cannot drive it through this tool")
+		}
+		// Owner is always the tool session id; never a value the model
+		// supplied. That is what keeps a second agent from impersonating
+		// the lease holder and stealing the tab.
+		owner = in.SessionID
+		if owner == "" {
+			owner = "default"
+		}
+
+		// Same-owner re-entry: if we already hold the lease we transparently
+		// refresh it. If nobody holds it, we auto-acquire briefly for this
+		// single action and release at the end. If someone else holds it,
+		// bail with a clear busy error naming the holder — the caller is
+		// expected to acquire explicitly via social_browser before starting
+		// a multi-step publish.
+		if ep.TryReenter(owner) {
+			heldByOwner = ep.Renew(owner)
+		}
+		if !heldByOwner {
+			if holder := ep.Holder(); holder != "" && holder != owner {
+				return Errorf("social browser busy: another session %q is publishing — try again in a moment", holder)
+			}
+			// Briefly acquire for this one action; release on the way out.
+			if err := ep.Acquire(ctx, owner, 0); err != nil {
+				return Errorf("%v", err)
+			}
+			defer ep.Release(owner)
+		}
+
+		var attachErr error
+		s, _, attachErr = socialSessionFor(ep)
+		if attachErr != nil {
+			return Errorf("attach to social browser: %v", attachErr)
+		}
+
+	default:
+		return Errorf("unknown session %q — use \"default\" or \"social\"", args.Session)
+	}
 
 	// Everything but close and navigate expects a page that is already open.
-	if action != "close" && action != "navigate" {
+	// The social session is different: the browser is already running under
+	// the manager, but no page is attached yet — Start() attaches to the
+	// existing browser and opens a fresh page. The check would false-fail on
+	// first use, so skip it for social.
+	if !social && action != "close" && action != "navigate" {
 		if !s.Started() {
 			return Errorf("no page is open yet — call browser with action \"navigate\" first")
 		}
@@ -192,7 +331,9 @@ func (browserTool) Execute(ctx context.Context, in Input) Result {
 		// Automatic anti-bot handling: if the page is a Cloudflare/Turnstile/
 		// captcha interstitial, wait for the stealth browser to clear it so the
 		// agent gets the real content instead of the challenge page.
-		autoClearChallenge(ctx, s, in.Emit)
+		if !social {
+			autoClearChallenge(ctx, s, in.Emit)
+		}
 		return browserPageSummary(ctx, s, "Opened")
 
 	case "snapshot":
@@ -326,7 +467,47 @@ func (browserTool) Execute(ctx context.Context, in Input) Result {
 		}
 		return Text(head)
 
+	case "upload":
+		if args.Ref == "" {
+			return Errorf("ref is required — snapshot the page and use the e-number of the <input type=file>")
+		}
+		if strings.TrimSpace(args.Path) == "" {
+			return Errorf("path is required — the local file to attach")
+		}
+		abs, err := resolveUploadPath(ctx, in, args.ProjectID, args.Path)
+		if err != nil {
+			return Errorf("%v", err)
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			return Errorf("cannot read %s: %v", args.Path, err)
+		}
+		if info.IsDir() {
+			return Errorf("%s is a directory — pick a file", args.Path)
+		}
+		if !info.Mode().IsRegular() {
+			return Errorf("%s is not a regular file", args.Path)
+		}
+		out, err := s.Upload(ctx, args.Ref, abs)
+		if err != nil {
+			return Errorf("%v", err)
+		}
+		return Text(out)
+
 	case "close":
+		if social {
+			// Never Close the shared social attach — that would leave the
+			// next social caller with a stale attach that fails on first
+			// use. Clearing it lets the next call re-attach fresh.
+			browserSessions.Lock()
+			if browserSessions.social != nil {
+				browserSessions.social.Stop()
+				browserSessions.social = nil
+				browserSessions.socialURL = ""
+			}
+			browserSessions.Unlock()
+			return Text("Detached from the social browser. The window itself stays open under the social manager.")
+		}
 		s.Stop()
 		browserSessions.Lock()
 		delete(browserSessions.byKey, key)
@@ -439,4 +620,81 @@ func evalStr(ctx context.Context, s *browser.Session) string {
 		return ""
 	}
 	return v
+}
+
+// creatorArtifactResolver is what the Content Creator service exposes for
+// authorizing per-project artifact reads: only paths registered on a
+// specific project (references[].path, shots[].keyframe_path/video_path/
+// last_frame_path, final_path) resolve to an absolute path; everything
+// else — .. traversal, symlink escapes, arbitrary files inside the project
+// directory, unrelated projects — is refused. The tool code calls this via
+// an interface rather than pinning the concrete Service type, so the
+// upload gate is expressible without a Deps struct change.
+type creatorArtifactResolver interface {
+	Artifact(ctx context.Context, projectID, relPath string) (string, error)
+}
+
+// resolveUploadPath authorizes a file for browser upload. Without
+// project_id it delegates to resolveRead so an ordinary session may upload
+// workspace files (and a project session may reach the wider machine, per
+// existing read semantics). With project_id it MUST resolve through the
+// Content Creator service's Artifact resolver, which returns paths ONLY
+// for artifacts registered on that project. This prevents a creator role
+// from uploading anything else on the machine — even a stray file inside
+// the project directory that is not on the registered artefact set,
+// another project's clips, the KV database, or the social fingerprint
+// seed — through the upload action.
+func resolveUploadPath(ctx context.Context, in Input, projectID, path string) (string, error) {
+	pid := strings.TrimSpace(projectID)
+	if rc, scoped := creator.RunFromContext(ctx); scoped && pid == "" {
+		pid = rc.ProjectID
+	}
+	if pid == "" {
+		return resolveRead(in, path)
+	}
+	if in.Deps == nil || in.Deps.Store == nil {
+		return "", fmt.Errorf("cannot resolve creator project %q: no store available", projectID)
+	}
+	svc := creator.New(in.Deps.Store, config.Path("content-creator"))
+
+	// Stage guard: when a creator run context is active, uploads MUST match
+	// the authorised run — same project, publish/full stage, auto mode for
+	// full, and a Publication that has already reached "uploading" (which is
+	// only set by prepare_publish). This closes the door on an LLM skipping
+	// prepare_publish and dropping a video straight into a publisher UI
+	// mid-research/mid-plan. Outside a creator run (ad-hoc chat) the guard
+	// stands down and the artefact resolver alone gates the path — the same
+	// behaviour the browser tool already provides for research/read flows.
+	if rc, ok := creator.RunFromContext(ctx); ok && rc.ProjectID != "" {
+		if rc.ProjectID != pid {
+			return "", fmt.Errorf("upload rejected: active run is for project %q, not %q", rc.ProjectID, pid)
+		}
+		if rc.PublishMode != "auto" {
+			return "", fmt.Errorf("upload rejected: draft runs cannot publish")
+		}
+		switch rc.Stage {
+		case "publish":
+			// allowed
+		case "full":
+			if rc.PublishMode != "auto" {
+				return "", fmt.Errorf("upload rejected: full run in %q mode does not permit publishing (publish_mode must be auto)", rc.PublishMode)
+			}
+		default:
+			return "", fmt.Errorf("upload rejected: current run stage %q does not permit publishing — run the publish stage first", rc.Stage)
+		}
+		proj, err := svc.Get(ctx, pid)
+		if err != nil {
+			return "", fmt.Errorf("creator project %q: %w", pid, err)
+		}
+		if proj.Publication.Status != "uploading" {
+			return "", fmt.Errorf("upload rejected: publication status is %q — call prepare_publish first so the artefact is registered as uploading", proj.Publication.Status)
+		}
+	}
+
+	var resolver creatorArtifactResolver = svc
+	abs, err := resolver.Artifact(ctx, pid, path)
+	if err != nil {
+		return "", fmt.Errorf("creator project %q: %w", projectID, err)
+	}
+	return abs, nil
 }

@@ -26,6 +26,9 @@ func queryTokenAllowed(path string) bool {
 		"/api/social/image":
 		return true
 	default:
+		if strings.HasPrefix(path, "/api/content-creator/projects/") && strings.HasSuffix(path, "/artifact") {
+			return true
+		}
 		return strings.HasPrefix(path, "/api/subagent/") && strings.HasSuffix(path, "/attach")
 	}
 }

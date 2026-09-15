@@ -177,6 +177,12 @@ export const ROUTE_MANIFEST: RouteManifestEntry[] = [
     descKey: 'system.desc',
   },
   {
+    id: 'content-creator',
+    path: '/content-creator',
+    titleKey: 'creator.title',
+    descKey: 'creator.desc',
+  },
+  {
     id: 'social-media',
     path: '/social-media',
     titleKey: 'social.title',

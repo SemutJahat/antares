@@ -174,6 +174,28 @@ not a transport error.
 | `POST /api/setup/test` | Try a provider and key |
 | `POST /api/setup/complete` | Write the configuration |
 
+## Content Creator
+
+| Method and path | Purpose |
+|---|---|
+| `GET /api/content-creator/projects` | List saved projects |
+| `POST /api/content-creator/projects` | Create a project with title and brief |
+| `GET /api/content-creator/projects/{id}` | Fetch current project, artifacts, and run status |
+| `PUT /api/content-creator/projects/{id}` | Update the plan using its current `revision` |
+| `POST /api/content-creator/projects/{id}/action` | Generate a reference/keyframe/clip, poll video, assemble, or explicitly reset |
+| `POST /api/content-creator/projects/{id}/run` | Start the Content Creator agent at a requested stage; returns `session_id` |
+| `POST /api/content-creator/projects/{id}/reconcile` | Operator verifies an uncertain upload was not published before another attempt |
+| `GET /api/content-creator/projects/{id}/artifact?path=...` | Read registered project media; supports video range requests |
+| `GET /api/content-creator/settings` | Read media configuration and FFmpeg availability without credentials |
+| `POST /api/content-creator/settings` | Save image/video configuration; blank API keys preserve existing keys |
+
+Media actions take `{ "action": "generate_video", "target_id": "shot-id" }`.
+Available actions: `generate_reference`, `generate_keyframe`, `generate_video`,
+`poll_video`, `assemble`, `reset_reference`, `reset_shot`. Resets also require
+`confirmed: true`. Video creation persists the provider job ID; poll it until
+complete instead of creating another paid job. Run requests take `stage` and
+`publish_mode`; a publish stage in draft mode is rejected.
+
 ## Errors
 
 ```json
