@@ -11,6 +11,7 @@ import (
 
 	"github.com/enowdev/antares/internal/config"
 	"github.com/enowdev/antares/internal/llm"
+	"github.com/enowdev/antares/internal/providers"
 	"github.com/enowdev/antares/internal/tools"
 )
 
@@ -272,6 +273,9 @@ func (s *Server) handleModelList(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
+	for i := range models {
+		models[i] = applyUserOverride(p, enrichModelInfo(id, models[i], p.Kind))
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": models})
 }
 
@@ -341,6 +345,7 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 			}
 			p := cfg.Providers[t.id]
 			for _, m := range list {
+				m = applyUserOverride(p, enrichModelInfo(t.id, m, p.Kind))
 				m = withOfficialReasoning(p.Kind, p.BaseURL, m)
 				models = append(models, row{ModelInfo: m, Provider: t.id, ProviderLabel: t.label})
 			}
@@ -370,6 +375,74 @@ func withOfficialReasoning(kind, baseURL string, m llm.ModelInfo) llm.ModelInfo 
 	}
 	m.Reasoning = true
 	m.ReasoningCap = &cap
+	return m
+}
+
+// enrichModelInfo fills in llm.ModelInfo fields that the provider's own
+// /models endpoint left blank (context window, pricing, capability flags) by
+// consulting the bundled models.dev snapshot. Provider-reported values win
+// when they are non-zero, so a live API is always trusted over a stale
+// snapshot. Called before withOfficialReasoning so the reasoning ladder
+// layer can still overwrite the capability flag for official providers.
+func enrichModelInfo(providerID string, m llm.ModelInfo, kind string) llm.ModelInfo {
+	meta, ok := providers.MetaByProvider(providerID, m.ID)
+	if !ok {
+		// OpenAI-compatible proxies (EnxAPI, custom endpoints, LiteLLM, …)
+		// re-serve official models under their real ids. When the strict
+		// provider/id lookup misses, fall back to searching every provider
+		// so the picker still shows correct context/cost — but only for
+		// these proxies, so a first-party provider that genuinely does not
+		// carry a model never inherits some unrelated entry.
+		if kind == "openai-compatible" || kind == "custom" {
+			meta, ok = providers.MetaByAnyProvider(m.ID)
+		}
+	}
+	if !ok {
+		return m
+	}
+	if m.Name == "" || m.Name == m.ID {
+		if meta.Name != "" {
+			m.Name = meta.Name
+		}
+	}
+	if m.ContextWindow == 0 && meta.ContextWindow > 0 {
+		m.ContextWindow = meta.ContextWindow
+	}
+	if m.MaxOutput == 0 && meta.MaxOutput > 0 {
+		m.MaxOutput = meta.MaxOutput
+	}
+	if m.InputCost == 0 && meta.Cost.Input > 0 {
+		m.InputCost = meta.Cost.Input
+	}
+	if m.OutputCost == 0 && meta.Cost.Output > 0 {
+		m.OutputCost = meta.Cost.Output
+	}
+	// Vision is a strict input-modality claim ("this model reads image
+	// bytes"). meta.Attachment is broader — it flips on for PDF/audio/video
+	// too — so folding it into Vision would mark an audio-only model as
+	// vision-capable and let the picker feed it images it will reject.
+	if !m.Vision && meta.Vision {
+		m.Vision = true
+	}
+	if !m.Tools && meta.ToolCall {
+		m.Tools = true
+	}
+	if !m.Reasoning && meta.Reasoning {
+		m.Reasoning = true
+	}
+	return m
+}
+
+// applyUserOverride swaps in fields the user pinned in cfg.Providers[id].ModelMeta.
+// Called after enrichModelInfo so the override always wins over live+generated.
+func applyUserOverride(p config.Provider, m llm.ModelInfo) llm.ModelInfo {
+	override, ok := p.ModelMeta[m.ID]
+	if !ok {
+		return m
+	}
+	if override.ContextWindow > 0 {
+		m.ContextWindow = override.ContextWindow
+	}
 	return m
 }
 

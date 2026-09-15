@@ -209,12 +209,18 @@ export default function ChatPage() {
   // event or, before any turn, the active model's window fetched on mount.
   const [ctxUsed, setCtxUsed] = useState(0)
   const [ctxWindow, setCtxWindow] = useState(0)
-  // The model's context window, known even before the first turn.
+  // The model's context window, known even before the first turn. Refetched
+  // whenever the active model changes so the gauge reflects the new pick
+  // immediately — no need to wait for the first usage event.
   useEffect(() => {
-    get<{ context_window?: number }>('/context-window')
-      .then((d) => setCtxWindow((w) => w || Number(d.context_window ?? 0)))
+    const q = activeModel ? `?model=${encodeURIComponent(activeModel)}` : ''
+    get<{ context_window?: number }>(`/context-window${q}`)
+      .then((d) => {
+        const w = Number(d.context_window ?? 0)
+        if (w > 0) setCtxWindow(w)
+      })
       .catch(() => {})
-  }, [])
+  }, [activeModel])
   // display.* prefs from config: whether to show reasoning at all, and the
   // live-stream character cap (trailing window). Defaults match server defaults.
   const [showReasoning, setShowReasoning] = useState(true)

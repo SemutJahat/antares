@@ -627,10 +627,18 @@ func (c *geminiClient) Models(ctx context.Context) ([]ModelInfo, error) {
 			continue
 		}
 		id := strings.TrimPrefix(m.Name, "models/")
+		// Gemini /models returns real token limits (InputTokenLimit /
+		// OutputTokenLimit); use those. Capability flags — vision,
+		// reasoning — are not in the response; leave them zero so the
+		// server layer enriches from the models.dev snapshot instead of
+		// guessing from the id ("contains 2.5" was wrong for every
+		// non-Gemini id a proxy happens to expose).
 		out = append(out, ModelInfo{
-			ID: id, Name: firstNonEmpty(m.DisplayName, id), Provider: c.opts.ProviderID,
-			ContextWindow: m.InputTokenLimit, MaxOutput: m.OutputTokenLimit,
-			Vision: true, Tools: true, Reasoning: strings.Contains(id, "2.5") || strings.Contains(id, "3"),
+			ID:            id,
+			Name:          firstNonEmpty(m.DisplayName, id),
+			Provider:      c.opts.ProviderID,
+			ContextWindow: m.InputTokenLimit,
+			MaxOutput:     m.OutputTokenLimit,
 		})
 	}
 	return out, nil

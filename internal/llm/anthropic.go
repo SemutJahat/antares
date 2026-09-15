@@ -427,9 +427,15 @@ func (c *anthropicClient) Models(ctx context.Context) ([]ModelInfo, error) {
 	}
 	out := make([]ModelInfo, 0, len(raw.Data))
 	for _, m := range raw.Data {
+		// The Anthropic /models endpoint does not return context window,
+		// max output, or capability flags. Emit only what the API tells us
+		// and let the server layer enrich from the models.dev snapshot;
+		// hard-coding 200000 across the family lied for Claude Sonnet 4.6
+		// (real window: 1M).
 		out = append(out, ModelInfo{
-			ID: m.ID, Name: firstNonEmpty(m.DisplayName, m.ID), Provider: c.opts.ProviderID,
-			ContextWindow: 200000, MaxOutput: 64000, Vision: true, Tools: true, Reasoning: true,
+			ID:       m.ID,
+			Name:     firstNonEmpty(m.DisplayName, m.ID),
+			Provider: c.opts.ProviderID,
 		})
 	}
 	return out, nil

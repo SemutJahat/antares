@@ -77,7 +77,8 @@ type Model struct {
 	cancel context.CancelFunc
 	msgCh  chan tea.Msg
 
-	tokensIn, tokensOut int
+	tokensIn, tokensOut  int
+	ctxUsed, ctxWindow   int
 	showReasoning       bool
 	status              string
 	themeName           string
@@ -455,6 +456,12 @@ func (m *Model) applyEvent(e agent.Event) {
 		m.blocks = append(m.blocks, block{kind: blockError, text: e.Err})
 	case agent.EventUsage:
 		m.tokensIn, m.tokensOut = e.InputTokens, e.OutputTokens
+		if e.ContextTokens > 0 {
+			m.ctxUsed = e.ContextTokens
+		}
+		if e.ContextWindow > 0 {
+			m.ctxWindow = e.ContextWindow
+		}
 	}
 }
 

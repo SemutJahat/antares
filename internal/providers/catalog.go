@@ -20,20 +20,29 @@ type Info struct {
 	Models   []string
 }
 
-// contextWindows records the true context window (in tokens) for models whose
-// provider API does not report one, keyed by model id. The agent consults this
-// when a config has no explicit model_meta, so the context gauge and compaction
-// use the real window instead of the 200k default. Source: provider docs.
+// contextWindows is the hand-curated escape hatch consulted by metadata.go's
+// cascade. Prefer regenerating the models.dev snapshot (make sync-models)
+// over adding an entry here; this map is for cases where upstream is missing
+// or wrong and cannot wait for a refresh.
 var contextWindows = map[string]int{
 	// Z.ai GLM — https://docs.z.ai/guides/llm
-	"glm-5.2": 1_000_000, // 1M context
+	// Kept as a reference example. The generated snapshot covers Z.ai too,
+	// so these values only win if models.dev regresses.
+	"glm-5.2": 1_000_000,
 	"glm-4.7": 200_000,
 	"glm-4.6": 200_000,
 }
 
-// ContextWindow returns the known context window for a model id, or 0 if none
-// is catalogued.
-func ContextWindow(model string) int { return contextWindows[model] }
+// ContextWindow returns the known context window for a model id, walking the
+// same cascade as Meta(): hand-curated overrides → generated models.dev
+// snapshot → 0 when nothing knows. Callers layer their own user-config
+// overrides on top; this function stays package-local by design.
+func ContextWindow(model string) int {
+	if m, ok := Meta(model); ok {
+		return m.ContextWindow
+	}
+	return 0
+}
 
 var catalog = []Info{
 	{"anthropic", "Anthropic", "anthropic", "ANTHROPIC_API_KEY", "", true,

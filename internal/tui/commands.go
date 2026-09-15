@@ -117,6 +117,7 @@ func (m *Model) cmdNew(string) (bool, tea.Cmd) {
 	m.sessionID = ""
 	m.title = ""
 	m.tokensIn, m.tokensOut = 0, 0
+	m.ctxUsed, m.ctxWindow = 0, 0
 	m.blocks = nil
 	m.greet()
 	m.setStatus("new session")
@@ -208,8 +209,16 @@ func (m *Model) cmdStatus(string) (bool, tea.Cmd) {
 	if sess == "" {
 		sess = "(new)"
 	}
-	m.pushSystem(fmt.Sprintf("Model: %s · %s\nSession: %s\nTokens: %d in / %d out\nReasoning: %s",
-		model, provider, sess, m.tokensIn, m.tokensOut, onOff(m.showReasoning)))
+	ctx := "—"
+	if m.ctxWindow > 0 {
+		pct := 0
+		if m.ctxUsed > 0 {
+			pct = m.ctxUsed * 100 / m.ctxWindow
+		}
+		ctx = fmt.Sprintf("%d / %d (%d%%)", m.ctxUsed, m.ctxWindow, pct)
+	}
+	m.pushSystem(fmt.Sprintf("Model: %s · %s\nSession: %s\nContext: %s\nTokens: %d in / %d out\nReasoning: %s",
+		model, provider, sess, ctx, m.tokensIn, m.tokensOut, onOff(m.showReasoning)))
 	return false, nil
 }
 
