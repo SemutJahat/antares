@@ -324,7 +324,7 @@ func runTerminalSetup(ctx context.Context, rt *runtimeServices) error {
 			entry.APIKey = key
 		}
 	}
-	cfg.Providers[chosen.id] = entry
+	cfg.Providers[cfg.Model.Provider] = entry
 
 	// 4. Model, verified against the provider when possible
 	fmt.Println()
