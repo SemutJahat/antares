@@ -16,8 +16,14 @@ import (
 
 func TestTerminalSetupPersistsNamedProvider(t *testing.T) {
 	t.Setenv("ANTARES_HOME", t.TempDir())
+	var receivedHeaders []string
 
 	fixture := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Tenant") != "team=a=b" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		receivedHeaders = append(receivedHeaders, r.Header.Get("X-Tenant"))
 		switch r.URL.Path {
 		case "/v1/models":
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -62,6 +68,10 @@ func TestTerminalSetupPersistsNamedProvider(t *testing.T) {
 		"7",                 // Custom provider
 		"Named Provider",    // provider name
 		fixture.URL + "/v1", // endpoint
+		"X-Tenant=team=a=b", // accepted header
+		"bad header=value",  // malformed header
+		"x-tenant=other",    // duplicate canonical header
+		"",                  // header terminator
 		"1",                 // first live model or manual fallback
 		"",                  // workspace
 		"",                  // PostgreSQL
@@ -98,5 +108,26 @@ func TestTerminalSetupPersistsNamedProvider(t *testing.T) {
 	}
 	if _, resolved := after.ResolveProvider(after.Model.Provider); resolved.BaseURL != fixture.URL+"/v1" {
 		t.Fatalf("resolved provider endpoint = %q, want %q", resolved.BaseURL, fixture.URL+"/v1")
+	}
+	if got.Headers["X-Tenant"] != "team=a=b" || len(got.Headers) != 1 {
+		t.Fatalf("named provider headers = %#v", got.Headers)
+	}
+	if len(receivedHeaders) < 2 {
+		t.Fatalf("provider probes = %d, want model list and final chat", len(receivedHeaders))
+	}
+	for _, header := range receivedHeaders {
+		if header != "team=a=b" {
+			t.Fatalf("probe header = %q, want accepted value", header)
+		}
+	}
+}
+
+func TestPromptProviderHeadersAllowsInitialBlank(t *testing.T) {
+	oldReader := stdinReader
+	stdinReader = bufio.NewReader(strings.NewReader("\n"))
+	t.Cleanup(func() { stdinReader = oldReader })
+
+	if headers := promptProviderHeaders(); headers == nil || len(headers) != 0 {
+		t.Fatalf("initial blank headers = %#v, want allocated empty map", headers)
 	}
 }

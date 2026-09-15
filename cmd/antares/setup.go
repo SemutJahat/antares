@@ -295,6 +295,7 @@ func runTerminalSetup(ctx context.Context, rt *runtimeServices) error {
 		if entry.BaseURL == "" {
 			return errors.New("a base URL is required for a custom provider")
 		}
+		entry.Headers = promptProviderHeaders()
 	case "ollama":
 		entry.BaseURL = promptLine("\n  Ollama URL (default http://127.0.0.1:11434/v1): ", "http://127.0.0.1:11434/v1")
 	case "lmstudio":
@@ -308,7 +309,7 @@ func runTerminalSetup(ctx context.Context, rt *runtimeServices) error {
 			fmt.Printf("  API key  %s\n", dim(chosen.keyHint))
 		}
 		key := promptSecret("  Paste it here (input hidden): ")
-		if key == "" && entry.APIKey == "" {
+		if key == "" && entry.APIKey == "" && len(entry.Headers) == 0 {
 			fmt.Println("\n  " + warn("No key entered — Antares will not be able to answer until one is set."))
 		} else if key != "" {
 			entry.APIKey = key
@@ -515,6 +516,45 @@ func promptLine(question, def string) string {
 		return def
 	}
 	return line
+}
+
+func promptProviderHeaders() map[string]string {
+	headers := make(map[string]string)
+	fmt.Println("  Headers (optional): enter HEADER=VALUE, one per line; blank line finishes.")
+	for {
+		fmt.Print("  Header: ")
+		line, err := stdinReader.ReadString('\n')
+		if err != nil && len(line) == 0 {
+			return headers
+		}
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		if strings.Trim(line, " \t") == "" {
+			return headers
+		}
+		firstEquals := strings.IndexByte(line, '=')
+		if firstEquals == -1 {
+			if strings.HasPrefix(strings.TrimLeft(line, " \t"), "#") {
+				continue
+			}
+			fmt.Println("  " + warn("Invalid header entry; use a unique HEADER=VALUE."))
+			continue
+		}
+
+		candidate, validationErr := config.NormalizeProviderHeaders(map[string]string{
+			line[:firstEquals]: line[firstEquals+1:],
+		})
+		if validationErr != nil {
+			fmt.Println("  " + warn("Invalid header entry; use a unique HEADER=VALUE."))
+			continue
+		}
+		for name, value := range candidate {
+			if _, exists := headers[name]; exists {
+				fmt.Println("  " + warn("Invalid header entry; use a unique HEADER=VALUE."))
+				continue
+			}
+			headers[name] = value
+		}
+	}
 }
 
 // promptSecret reads without echoing, falling back to a visible read when the
