@@ -129,18 +129,19 @@ are written to `~/.antares/logs/daemon.log`.
 
 ### Accessing it from another machine
 
-The production binary binds `127.0.0.1` by default so the dashboard stays on
-this machine. Inside a container Antares detects the environment and switches
-to `0.0.0.0` automatically so `docker run -p 8787:8787` (or a Kubernetes
-port-forward) reaches it without extra config. To expose it anywhere else,
-set `server.host` in `config.yaml`, or export `ANTARES_HOST` before starting
-the process — the environment variable wins over both the container heuristic
-and the loopback fallback. Vite also binds loopback in dev; set `HOST=0.0.0.0`
-to expose it on the network.
+The production binary binds `127.0.0.1` by default. Inside a container the
+first boot seeds `server.host: 0.0.0.0` into `config.yaml` once so `docker
+run -p 8787:8787` and Kubernetes port-forwards reach it out of the box;
+later boots read the stored value verbatim so your edits stick. To expose
+the binary elsewhere, edit `server.host` in `config.yaml` or export
+`ANTARES_HOST` before starting. `ANTARES_HOST` is a per-process override
+applied on every load — it wins for the current run but is **not** written
+to disk, so unsetting it restores the stored value on the next boot. Vite
+also binds loopback in dev; set `HOST=0.0.0.0` to expose it on the LAN.
 
 ```
-http://<tailscale-ip>:8787     # production binary, after setting server.host
-ANTARES_HOST=0.0.0.0 antares   # one-off exposure via env var
+http://<tailscale-ip>:8787     # production binary, after editing server.host
+ANTARES_HOST=0.0.0.0 antares   # one-off exposure via env var; config.yaml is not changed
 HOST=0.0.0.0 make dev-web      # dev, exposed on the LAN
 ```
 

@@ -55,12 +55,10 @@ func Default() *Config {
 		},
 		Server: Server{
 			Host: defaultHost(), Port: 8787,
-			// defaultHost() picks a bind address safe for where Antares is
-			// running: loopback on a laptop, wildcard inside a container so
-			// docker port-forwarding still works, or the ANTARES_HOST override
-			// when an installer / systemd unit / operator set one. Same-origin
-			// is the safe default for CORS; cross-origin access must be
-			// explicitly configured by the operator.
+			// defaultHost() seeds loopback on bare metal, wildcard in a
+			// container. ANTARES_HOST is a per-load runtime override
+			// applied in applyEnv; it never touches the persisted seed.
+			// CORS starts same-origin only.
 			CORSOrigins: []string{},
 		},
 		Agent: Agent{
@@ -152,22 +150,10 @@ func Default() *Config {
 	}
 }
 
-// defaultHost picks the address the dashboard should bind to when the config
-// leaves server.host empty. Precedence, high to low:
-//
-//  1. ANTARES_HOST — installers, systemd units, and one-off overrides win
-//     over every heuristic. An empty value is ignored so a stray `export
-//     ANTARES_HOST=` in a shell profile does not break the default.
-//  2. Container heuristic — inside Docker / Podman / Kubernetes the process
-//     must bind the wildcard address for host port forwarding to reach it.
-//  3. Loopback fallback — everything else. Fresh installs on a laptop stay
-//     on this machine only; ValidateListen still refuses a non-loopback
-//     bind without an auth token or dashboard password if the user opts in
-//     via config or ANTARES_HOST.
+// defaultHost picks the seed for a fresh config.yaml. It does not read
+// ANTARES_HOST — that env var is a runtime override applied by applyEnv, so
+// a transient export never gets baked into the persisted file.
 func defaultHost() string {
-	if h := os.Getenv("ANTARES_HOST"); h != "" {
-		return h
-	}
 	if inContainer() {
 		return "0.0.0.0"
 	}
