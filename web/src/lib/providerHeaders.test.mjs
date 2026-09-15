@@ -14,7 +14,13 @@ describe('provider header parsing', () => {
   })
 
   test('rejects duplicate casing and malformed entries', () => {
-    for (const input of ['X-Test=one\nx-test=two', 'Bad Header=value', 'X-Test=bad\u0001value']) {
+    for (const input of [
+      'X-Test=one\nx-test=two',
+      'Bad Header=value',
+      'X-Test=bad\u0001value',
+      'X-Test=value\r',
+      'X-Test=value\rY-Test=other',
+    ]) {
       expect(() => parseProviderHeaders(input)).toThrow('invalid_header_entries')
     }
   })

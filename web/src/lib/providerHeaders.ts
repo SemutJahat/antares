@@ -4,7 +4,7 @@ export function parseProviderHeaders(text: string): Record<string, string> {
   const headers = Object.create(null) as Record<string, string>
   const seen = new Set<string>()
 
-  for (const rawLine of text.replace(/\r\n?/g, '\n').split('\n')) {
+  for (const rawLine of text.replace(/\r\n/g, '\n').split('\n')) {
     if (!rawLine.trim()) continue
     const firstEquals = rawLine.indexOf('=')
     if (firstEquals === -1) {
