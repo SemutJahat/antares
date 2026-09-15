@@ -33,8 +33,10 @@ opencode.json
 AGENTS.md
 .worktrees/
 .superpowers/
+.codegraph/
 
 # Release artifacts
 dist/
 !internal/server/dist/
 !internal/server/dist/.gitkeep
+web/tsconfig.tsbuildinfo
