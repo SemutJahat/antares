@@ -49,23 +49,141 @@ func (s *Server) handleProviderModelInfo(w http.ResponseWriter, r *http.Request)
 // then a sane default.
 func (s *Server) handleContextWindow(w http.ResponseWriter, r *http.Request) {
 	cfg := s.config()
-	model := cfg.Model.Default
-	// Same precedence as the agent's contextWindowFor: per-model meta override,
-	// then the provider catalogue (real windows for known models like glm-5.2's
-	// 1M), then the configured window, then a sane default.
-	window := 128000
-	if w := providers.ContextWindow(model); w > 0 {
-		window = w
-	} else if cfg.Model.ContextWindow > 0 {
-		window = cfg.Model.ContextWindow
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	// The dashboard ModelPicker sends "provider/model-id" (e.g. "enx/kimi-k2.6").
+	// Split it so resolveContextWindow can prefer the caller-named provider
+	// and match against its Models/ModelMeta lists.
+	provider := strings.TrimSpace(r.URL.Query().Get("provider"))
+	if provider == "" && strings.Contains(model, "/") {
+		provider, model, _ = strings.Cut(model, "/")
 	}
-	for _, p := range cfg.Providers {
+	if model == "" {
+		model = cfg.Model.Default
+	}
+	if provider == "" {
+		provider = cfg.Model.Provider
+	}
+	window := resolveContextWindowFor(cfg, provider, model)
+	writeJSON(w, http.StatusOK, map[string]any{"context_window": window, "model": model, "provider": provider})
+}
+
+// resolveContextWindowFor is resolveContextWindow with an explicit provider
+// hint, so a caller who names the provider (dashboard picker) skips the
+// heuristic that walks every provider config. Falls through to the general
+// cascade when the hint is empty.
+func resolveContextWindowFor(cfg *config.Config, provider, model string) int {
+	if cfg == nil || model == "" {
+		return 128000
+	}
+	if provider != "" {
+		p := cfg.Providers[provider]
 		if m, ok := p.ModelMeta[model]; ok && m.ContextWindow > 0 {
-			window = m.ContextWindow
-			break
+			return m.ContextWindow
+		}
+		if meta, ok := providers.MetaByProvider(provider, model); ok && meta.ContextWindow > 0 {
+			return meta.ContextWindow
+		}
+		if p.Kind == "openai-compatible" || p.Kind == "custom" {
+			if meta, ok := providers.MetaByAnyProvider(model); ok && meta.ContextWindow > 0 {
+				return meta.ContextWindow
+			}
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"context_window": window, "model": model})
+	return resolveContextWindow(cfg, model)
+}
+
+// resolveContextWindow mirrors agent.contextWindowFor so the dashboard's
+// gauge and the compaction threshold cannot disagree. Cascade:
+//
+//  1. Per-provider user override in cfg.Providers[…].ModelMeta — but only
+//     for the provider that actually declares the model, not every one.
+//  2. Strict providers.MetaByProvider — for the model's owning provider.
+//  3. Proxy fallback: for openai-compatible / custom providers only,
+//     search the whole models.dev snapshot by bare id.
+//  4. Global fallback cfg.Model.ContextWindow — the Settings > Model page's
+//     "Context Window" field. 0 (default) means "not set" so we skip.
+//  5. 128000 safety net.
+//
+// The earlier version iterated every provider in the config and returned the
+// first hit, which caused providers.MetaByProvider's loose fallback to attribute
+// the wrong context/cost to any unrelated provider — e.g. reading Anthropic's
+// entry for a request against a Kimi model.
+func resolveContextWindow(cfg *config.Config, model string) int {
+	if cfg == nil || model == "" {
+		return 128000
+	}
+	candidates := candidateProviders(cfg, model)
+	// First pass: strict provider/id lookup for each candidate.
+	for _, providerID := range candidates {
+		p := cfg.Providers[providerID]
+		if m, ok := p.ModelMeta[model]; ok && m.ContextWindow > 0 {
+			return m.ContextWindow
+		}
+		if meta, ok := providers.MetaByProvider(providerID, model); ok && meta.ContextWindow > 0 {
+			return meta.ContextWindow
+		}
+	}
+	// Second pass: proxy fallback. If any candidate provider is an
+	// openai-compatible proxy (EnxAPI, LiteLLM, custom endpoint), consult
+	// the bare-id lookup — those proxies re-serve official models under
+	// real ids without cataloguing them anywhere models.dev can see.
+	for _, providerID := range candidates {
+		if !isProxyKind(cfg.Providers[providerID].Kind) {
+			continue
+		}
+		if meta, ok := providers.MetaByAnyProvider(model); ok && meta.ContextWindow > 0 {
+			return meta.ContextWindow
+		}
+	}
+	if cfg.Model.ContextWindow > 0 {
+		return cfg.Model.ContextWindow
+	}
+	return 128000
+}
+
+// isProxyKind reports whether a provider is an OpenAI-compatible passthrough
+// that re-serves official models under real ids. Only such providers opt in
+// to the bare-id metadata fallback; first-party providers (anthropic, openai,
+// gemini, cursor-agent, opencode) always resolve by strict provider/id.
+func isProxyKind(kind string) bool {
+	switch kind {
+	case "openai-compatible", "custom":
+		return true
+	default:
+		return false
+	}
+}
+
+// candidateProviders returns provider ids to check for a model, in priority
+// order. The active provider wins so /api/context-window (which reads the
+// default model) sees the same answer as an active turn. After that, any
+// provider whose Models list *or* ModelMeta keys mention the id — a provider
+// that carries a per-model meta override has clearly claimed the model.
+// Result is de-duplicated and never empty when a provider is configured.
+func candidateProviders(cfg *config.Config, model string) []string {
+	seen := map[string]bool{}
+	var out []string
+	push := func(id string) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	push(cfg.Model.Provider)
+	for providerID, p := range cfg.Providers {
+		if _, ok := p.ModelMeta[model]; ok {
+			push(providerID)
+			continue
+		}
+		for _, m := range p.Models {
+			if m == model {
+				push(providerID)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // handleAddProviderModel adds a model id to providers.<id>.models, with an

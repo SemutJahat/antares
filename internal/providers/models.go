@@ -34,3 +34,22 @@ func FetchModels(ctx context.Context, cfg *config.Config, providerID string) ([]
 	}
 	return out, nil
 }
+
+// FetchModelInfos is FetchModels' richer cousin: same live /models probe but
+// keeps every field the adapter fills in (context window, capability flags,
+// pricing when the provider reports it). Callers that render a picker with
+// window/cost badges should use this; callers that only need ids call
+// FetchModels and stay allocation-light.
+func FetchModelInfos(ctx context.Context, cfg *config.Config, providerID string) ([]llm.ModelInfo, error) {
+	id, p := cfg.ResolveProvider(providerID)
+	client, err := llm.New(llm.Options{
+		Kind: p.Kind, BaseURL: p.BaseURL, APIKey: p.APIKey, Headers: p.Headers,
+		ProviderID: id, Timeout: 20 * time.Second, APIVersion: p.APIVersion, Region: p.Region,
+	})
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return client.Models(ctx)
+}

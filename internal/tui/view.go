@@ -128,7 +128,7 @@ func (m *Model) mainColumn() string {
 	if m.sessionID != "" {
 		left += " " + m.st.headerDim.Render(shortID(m.sessionID))
 	}
-	right := m.st.headerDim.Render(fmt.Sprintf("%d↑ %d↓", m.tokensIn, m.tokensOut))
+	right := m.st.headerDim.Render(m.headerUsage())
 	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
 		gap = 1
@@ -186,6 +186,20 @@ func (m *Model) sidebar() string {
 	}
 	section("Session", truncate(sess, 22))
 	section("Tokens", fmt.Sprintf("%d in / %d out", m.tokensIn, m.tokensOut))
+	// Prefer the live event's window (arrives once a turn runs), fall back
+	// to the metadata cascade for the active model so a fresh session still
+	// shows what the model's budget will be.
+	window := m.ctxWindow
+	if window == 0 && m.cfg != nil {
+		window = providerModelWindow(m.cfg, m.cfg.Model.Provider, m.cfg.Model.Default)
+	}
+	if window > 0 {
+		pct := 0
+		if m.ctxUsed > 0 {
+			pct = m.ctxUsed * 100 / window
+		}
+		section("Context", fmt.Sprintf("%dK / %dK (%d%%)", m.ctxUsed/1000, window/1000, pct))
+	}
 
 	reason := m.st.stErr.Render("off")
 	if m.showReasoning {
@@ -445,4 +459,23 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// headerUsage renders the token counters and — when the model's context
+// window is known (from the live usage event or, before any turn, the
+// metadata cascade) — a "used/window" ratio next to them.
+func (m *Model) headerUsage() string {
+	base := fmt.Sprintf("%d↑ %d↓", m.tokensIn, m.tokensOut)
+	window := m.ctxWindow
+	if window == 0 && m.cfg != nil {
+		window = providerModelWindow(m.cfg, m.cfg.Model.Provider, m.cfg.Model.Default)
+	}
+	if window <= 0 {
+		return base
+	}
+	pct := 0
+	if m.ctxUsed > 0 {
+		pct = m.ctxUsed * 100 / window
+	}
+	return fmt.Sprintf("%s · %dK/%dK (%d%%)", base, m.ctxUsed/1000, window/1000, pct)
 }

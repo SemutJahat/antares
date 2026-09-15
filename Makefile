@@ -119,6 +119,10 @@ check: vet test typecheck web-test ## Run every check (add `make smoke` for the 
 fmt: ## Format Go sources
 	@$(GO) fmt ./...
 
+.PHONY: sync-models
+sync-models: ## Refresh internal/providers/models_generated.json from models.dev
+	@$(GO) run ./scripts/sync-models-dev.go
+
 .PHONY: release
 release: ## Cross-compile release binaries for all platforms into dist/release
 	@VERSION="$(VERSION)" GO="$(GO)" BUN="$(BUN)" ./scripts/release-build.sh

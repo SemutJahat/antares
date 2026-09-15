@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/enowdev/antares/internal/config"
 	"github.com/enowdev/antares/internal/providers"
 )
 
@@ -44,7 +45,13 @@ func (m *Model) openThemePicker() {
 
 // ---- model picker ------------------------------------------------------------
 
-type modelRef struct{ id, prov string }
+// modelRef pairs a model id with its provider — plus the context window
+// when the enrichment cascade knows it, so the picker can show a "1000K"
+// badge next to the provider tag.
+type modelRef struct {
+	id, prov      string
+	contextWindow int
+}
 
 // modelsFetchedMsg carries models pulled live from provider endpoints.
 type modelsFetchedMsg struct{ refs []modelRef }
@@ -60,7 +67,11 @@ func (m *Model) collectConfigModels() []modelRef {
 			return
 		}
 		seen[prov+"\x00"+id] = true
-		list = append(list, modelRef{id, prov})
+		list = append(list, modelRef{
+			id:            id,
+			prov:          prov,
+			contextWindow: providerModelWindow(m.cfg, prov, id),
+		})
 	}
 	prov := m.cfg.Model.Provider
 	if prov != "" {
@@ -70,6 +81,29 @@ func (m *Model) collectConfigModels() []modelRef {
 	}
 	add(m.cfg.Model.Default, prov)
 	return list
+}
+
+// providerModelWindow resolves the context window for a picker row through
+// the same cascade the server uses (per-provider user override → strict
+// generated snapshot → proxy fallback for openai-compatible/custom). Returns
+// 0 when nothing knows so the picker skips the badge instead of showing "0K".
+func providerModelWindow(cfg *config.Config, provider, model string) int {
+	if cfg == nil || provider == "" || model == "" {
+		return 0
+	}
+	p := cfg.Providers[provider]
+	if meta, ok := p.ModelMeta[model]; ok && meta.ContextWindow > 0 {
+		return meta.ContextWindow
+	}
+	if meta, ok := providers.MetaByProvider(provider, model); ok && meta.ContextWindow > 0 {
+		return meta.ContextWindow
+	}
+	if p.Kind == "openai-compatible" || p.Kind == "custom" {
+		if meta, ok := providers.MetaByAnyProvider(model); ok && meta.ContextWindow > 0 {
+			return meta.ContextWindow
+		}
+	}
+	return 0
 }
 
 // fetchableProviders is the active provider alone (when it can be reached), so
@@ -90,11 +124,13 @@ func (m *Model) fetchableProviders() []string {
 	}
 	return nil
 }
-
 func (m *Model) modelItem(r modelRef) pickerItem {
 	right := ""
-	if r.prov != "" {
-		right = lipgloss.NewStyle().Foreground(themeByName(m.themeName).Faint).Render(r.prov)
+	faint := lipgloss.NewStyle().Foreground(themeByName(m.themeName).Faint)
+	if r.contextWindow > 0 {
+		right = faint.Render(fmt.Sprintf("%dK ctx · %s", r.contextWindow/1000, r.prov))
+	} else if r.prov != "" {
+		right = faint.Render(r.prov)
 	}
 	return pickerItem{id: r.id, label: r.id, right: right, meta: r.prov}
 }
@@ -150,7 +186,9 @@ func (m *Model) openModelPicker() tea.Cmd {
 	return m.fetchModelsCmd(fetch)
 }
 
-// fetchModelsCmd queries the given providers' /models endpoints concurrently.
+// fetchModelsCmd queries the given providers' /models endpoints concurrently,
+// keeping the enriched metadata so the picker can show a context-window
+// badge next to each row.
 func (m *Model) fetchModelsCmd(provs []string) tea.Cmd {
 	if len(provs) == 0 || m.cfg == nil {
 		return nil
@@ -164,13 +202,17 @@ func (m *Model) fetchModelsCmd(provs []string) tea.Cmd {
 			wg.Add(1)
 			go func(pid string) {
 				defer wg.Done()
-				ids, err := providers.FetchModels(context.Background(), cfg, pid)
+				infos, err := providers.FetchModelInfos(context.Background(), cfg, pid)
 				if err != nil {
 					return
 				}
 				mu.Lock()
-				for _, id := range ids {
-					refs = append(refs, modelRef{id, pid})
+				for _, info := range infos {
+					window := info.ContextWindow
+					if window == 0 {
+						window = providerModelWindow(cfg, pid, info.ID)
+					}
+					refs = append(refs, modelRef{id: info.ID, prov: pid, contextWindow: window})
 				}
 				mu.Unlock()
 			}(pid)
