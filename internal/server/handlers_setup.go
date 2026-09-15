@@ -202,9 +202,10 @@ func (s *Server) handleSetupTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Provider string `json:"provider"`
-		BaseURL  string `json:"base_url"`
-		APIKey   string `json:"api_key"`
+		Provider string            `json:"provider"`
+		BaseURL  string            `json:"base_url"`
+		APIKey   string            `json:"api_key"`
+		Headers  map[string]string `json:"headers"`
 	}
 	if err := decodeBody(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -244,6 +245,15 @@ func (s *Server) handleSetupTest(w http.ResponseWriter, r *http.Request) {
 			apiKey = p.APIKey
 		}
 	}
+	headers := cfg.Providers[body.Provider].Headers
+	if chosen.Custom && body.Headers != nil {
+		var err error
+		headers, err = config.NormalizeProviderHeaders(body.Headers)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
 	// A keyless custom service on a LAN is legitimate; everything else needs
 	// a credential unless the endpoint is local.
 	if apiKey == "" && !chosen.Custom && !isLocalEndpoint(baseURL) {
@@ -254,7 +264,7 @@ func (s *Server) handleSetupTest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client, err := llm.New(llm.Options{
-		Kind: chosen.Kind, BaseURL: baseURL, APIKey: apiKey,
+		Kind: chosen.Kind, BaseURL: baseURL, APIKey: apiKey, Headers: headers,
 		ProviderID: body.Provider, Timeout: 30 * time.Second,
 	})
 	if err != nil {
@@ -305,12 +315,13 @@ func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Provider  string `json:"provider"`
-		Name      string `json:"name"`
-		BaseURL   string `json:"base_url"`
-		APIKey    string `json:"api_key"`
-		Model     string `json:"model"`
-		Workspace string `json:"workspace"`
+		Provider  string            `json:"provider"`
+		Name      string            `json:"name"`
+		BaseURL   string            `json:"base_url"`
+		APIKey    string            `json:"api_key"`
+		Headers   map[string]string `json:"headers"`
+		Model     string            `json:"model"`
+		Workspace string            `json:"workspace"`
 		Database  struct {
 			Driver string `json:"driver"`
 			DSN    string `json:"dsn"`
@@ -378,6 +389,19 @@ func (s *Server) handleSetupComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	if baseURL != "" {
 		entry.BaseURL = baseURL
+	}
+	if chosen.Custom {
+		if entry.Headers == nil {
+			entry.Headers = cfg.Providers[body.Provider].Headers
+		}
+		if body.Headers != nil {
+			headers, err := config.NormalizeProviderHeaders(body.Headers)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			entry.Headers = headers
+		}
 	}
 	if key := strings.TrimSpace(body.APIKey); key != "" && !strings.Contains(key, "••••") {
 		entry.APIKey = key
@@ -551,7 +575,7 @@ func (s *Server) handleSetProviderKey(w http.ResponseWriter, r *http.Request) {
 
 	// Reject a bad key here rather than saving it and failing on the next turn.
 	client, err := llm.New(llm.Options{
-		Kind: entry.Kind, BaseURL: baseURL, APIKey: key,
+		Kind: entry.Kind, BaseURL: baseURL, APIKey: key, Headers: entry.Headers,
 		Region: region, APIVersion: apiVersion,
 		ProviderID: id, Timeout: 30 * time.Second,
 	})

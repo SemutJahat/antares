@@ -156,15 +156,16 @@ func (s *Server) handleModelOptions(w http.ResponseWriter, r *http.Request) {
 		BaseURL string `json:"base_url"`
 		Active  bool   `json:"active"`
 		// Setup metadata, so the connect form can render the right fields.
-		Hint            string `json:"hint,omitempty"`
-		KeyHint         string `json:"key_hint,omitempty"`
-		KeyURL          string `json:"key_url,omitempty"`
-		KeyLabel        string `json:"key_label,omitempty"`
-		Note            string `json:"note,omitempty"`
-		NeedsRegion     bool   `json:"needs_region,omitempty"`
-		NeedsAPIVersion bool   `json:"needs_api_version,omitempty"`
-		NeedsBaseURL    bool   `json:"needs_base_url,omitempty"`
-		TimeoutSecs     int    `json:"timeout_seconds,omitempty"`
+		Hint            string            `json:"hint,omitempty"`
+		KeyHint         string            `json:"key_hint,omitempty"`
+		KeyURL          string            `json:"key_url,omitempty"`
+		KeyLabel        string            `json:"key_label,omitempty"`
+		Note            string            `json:"note,omitempty"`
+		NeedsRegion     bool              `json:"needs_region,omitempty"`
+		NeedsAPIVersion bool              `json:"needs_api_version,omitempty"`
+		NeedsBaseURL    bool              `json:"needs_base_url,omitempty"`
+		TimeoutSecs     int               `json:"timeout_seconds,omitempty"`
+		Headers         map[string]string `json:"headers,omitempty"`
 		// Custom marks a user-defined provider. Customs always group under
 		// "API key" — even a localhost endpoint is a configured service, not
 		// one of the built-in local runtimes.
@@ -177,6 +178,7 @@ func (s *Server) handleModelOptions(w http.ResponseWriter, r *http.Request) {
 	// installations may still use that id for their real custom provider.
 	seen := map[string]bool{}
 	providerList := make([]providerInfo, 0)
+	exposeHeaders := cfg.Server.DashboardLocked() || s.bearerAuthorizedOrQuery(r)
 	for _, sp := range setupProviderCatalogue(cfg) {
 		p := cfg.Providers[sp.ID]
 		if sp.Custom && !legacyCustomProviderInUse(cfg, p) {
@@ -188,14 +190,18 @@ func (s *Server) handleModelOptions(w http.ResponseWriter, r *http.Request) {
 			label = firstNonEmpty(p.Label, sp.Label)
 			kind = firstNonEmpty(p.Kind, sp.Kind)
 		}
-		providerList = append(providerList, providerInfo{
+		info := providerInfo{
 			ID: sp.ID, Label: label, Kind: kind,
 			Enabled: p.Enabled, HasKey: p.APIKey != "", Local: sp.Local,
 			BaseURL: firstNonEmpty(p.BaseURL, sp.BaseURL), Active: sp.ID == cfg.Model.Provider,
 			Hint: sp.Hint, KeyHint: sp.KeyHint, KeyURL: sp.KeyURL, KeyLabel: sp.KeyLabel,
 			Note: sp.Note, NeedsRegion: sp.NeedsRegion, NeedsAPIVersion: sp.NeedsAPIVersion,
 			NeedsBaseURL: sp.NeedsBaseURL, TimeoutSecs: p.TimeoutSecs, Custom: sp.Custom,
-		})
+		}
+		if sp.Custom && exposeHeaders {
+			info.Headers = p.Headers
+		}
+		providerList = append(providerList, info)
 		seen[sp.ID] = true
 	}
 	names := make([]string, 0, len(cfg.Providers))
@@ -207,12 +213,16 @@ func (s *Server) handleModelOptions(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(names)
 	for _, name := range names {
 		p := cfg.Providers[name]
-		providerList = append(providerList, providerInfo{
+		info := providerInfo{
 			ID: name, Label: firstNonEmpty(p.Label, name), Kind: p.Kind, Enabled: p.Enabled,
 			HasKey: p.APIKey != "", BaseURL: p.BaseURL,
 			Active: name == cfg.Model.Provider, TimeoutSecs: p.TimeoutSecs,
 			Custom: true, NeedsBaseURL: true,
-		})
+		}
+		if exposeHeaders {
+			info.Headers = p.Headers
+		}
+		providerList = append(providerList, info)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
