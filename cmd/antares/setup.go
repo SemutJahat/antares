@@ -24,17 +24,7 @@ import (
 )
 
 // needsSetup reports whether Antares has enough configuration to answer at all.
-func needsSetup(cfg *config.Config) bool {
-	if strings.TrimSpace(cfg.Model.Default) == "" {
-		return true
-	}
-	_, p := cfg.ResolveProvider(cfg.Model.Provider)
-	// A local endpoint needs no credential; everything else does.
-	if p.APIKey == "" && !isLocalEndpoint(p.BaseURL) {
-		return true
-	}
-	return false
-}
+func needsSetup(cfg *config.Config) bool { return server.NeedsSetup(cfg) }
 
 func isLocalEndpoint(url string) bool {
 	l := strings.ToLower(url)

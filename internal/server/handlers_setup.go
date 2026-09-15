@@ -175,8 +175,16 @@ func NeedsSetup(cfg *config.Config) bool {
 	if strings.TrimSpace(cfg.Model.Default) == "" {
 		return true
 	}
-	_, p := cfg.ResolveProvider(cfg.Model.Provider)
-	return p.APIKey == "" && !isLocalEndpoint(p.BaseURL)
+	id, p := cfg.ResolveProvider(cfg.Model.Provider)
+	return p.APIKey == "" && !isLocalEndpoint(p.BaseURL) && !customProviderHasHeaders(cfg, id, p)
+}
+
+func customProviderHasHeaders(cfg *config.Config, id string, p config.Provider) bool {
+	if strings.TrimSpace(p.BaseURL) == "" || len(p.Headers) == 0 {
+		return false
+	}
+	provider := lookupSetupProvider(cfg, id)
+	return provider == nil || provider.Custom
 }
 
 func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {

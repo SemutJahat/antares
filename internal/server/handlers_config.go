@@ -251,7 +251,7 @@ func (s *Server) handleModelList(w http.ResponseWriter, r *http.Request) {
 	// Calling a provider we know has no credential just turns a known state
 	// into an opaque 401. Report the missing key instead.
 	id, p := cfg.ResolveProvider(provider)
-	if p.APIKey == "" && !isLocalEndpoint(p.BaseURL) {
+	if p.APIKey == "" && !isLocalEndpoint(p.BaseURL) && !customProviderHasHeaders(cfg, id, p) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"models": []any{}, "needs_key": true, "provider": id,
 		})
@@ -286,7 +286,8 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := s.config()
 
-	// Which providers are worth calling: a stored key, a set key-env, or local.
+	// Which providers are worth calling: a stored key, a set key-env, local, or
+	// a configured custom provider with explicit request headers.
 	type target struct {
 		id, label string
 	}
@@ -298,7 +299,7 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 		}
 		p := cfg.Providers[id]
 		keyed := p.APIKey != "" || (p.APIKeyEnv != "" && os.Getenv(p.APIKeyEnv) != "")
-		if keyed || isLocalEndpoint(p.BaseURL) {
+		if keyed || isLocalEndpoint(p.BaseURL) || customProviderHasHeaders(cfg, id, p) {
 			targets = append(targets, target{id: id, label: firstNonEmpty(p.Label, label, id)})
 			seen[id] = true
 		}

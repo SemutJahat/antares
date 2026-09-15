@@ -1,10 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -175,5 +178,86 @@ func TestProviderHeadersSetupTestAndComplete(t *testing.T) {
 	}
 	if got := reloaded.Providers["header-setup"].Headers["X-Tenant"]; got != *expected {
 		t.Fatalf("completed headers = %q, want %q", got, *expected)
+	}
+}
+
+func TestHeaderAuthenticatedCustomProviderIsReadyAndDiscoverable(t *testing.T) {
+	fixture, expected := headerProviderFixture(t)
+	aliasURL := "http://127.0.0.2:" + strconv.Itoa(fixture.Listener.Addr().(*net.TCPAddr).Port) + "/v1"
+
+	originalTransport := http.DefaultTransport
+	transport := originalTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, fixture.Listener.Addr().String())
+	}
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+
+	cfg := config.Default()
+	cfg.Server.DashboardPasswordHash = "test-hash"
+	cfg.Model.Provider = "header-gateway"
+	cfg.Model.Default = "header-model"
+	cfg.Providers["header-gateway"] = config.Provider{
+		Kind: "openai-compatible", BaseURL: aliasURL, Enabled: true,
+		Headers: map[string]string{"X-Tenant": *expected},
+	}
+	if NeedsSetup(cfg) {
+		t.Fatal("header-authenticated custom provider still needs setup")
+	}
+	if NeedsSetup(&config.Config{Model: config.Model{Provider: "header-gateway", Default: "header-model"}, Providers: map[string]config.Provider{"header-gateway": {BaseURL: aliasURL}}}) == false {
+		t.Fatal("headerless remote provider did not need setup")
+	}
+	if NeedsSetup(&config.Config{Model: config.Model{Provider: "openai", Default: "gpt-5"}, Providers: map[string]config.Provider{"openai": {BaseURL: "https://api.openai.com/v1", Headers: map[string]string{"X-Tenant": *expected}}}}) == false {
+		t.Fatal("built-in provider headers bypassed setup")
+	}
+
+	db, err := store.Open(t.Context(), "memory", "", 1, 5000, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	s := &Server{cfg: cfg, db: db, agent: agent.New(cfg, db, nil, nil, nil)}
+
+	status := httptest.NewRecorder()
+	s.handleStatus(status, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	var statusBody struct {
+		ProviderReady bool `json:"provider_ready"`
+		NeedsSetup    bool `json:"needs_setup"`
+	}
+	if err := json.Unmarshal(status.Body.Bytes(), &statusBody); err != nil {
+		t.Fatal(err)
+	}
+	if !statusBody.ProviderReady || statusBody.NeedsSetup {
+		t.Fatalf("status = %#v, want ready and complete", statusBody)
+	}
+
+	list := httptest.NewRecorder()
+	s.handleModelList(list, httptest.NewRequest(http.MethodGet, "/api/models?provider=header-gateway", nil))
+	var listBody struct {
+		Models []struct {
+			ID string `json:"id"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &listBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(listBody.Models) != 1 || listBody.Models[0].ID != "header-model" {
+		t.Fatalf("single provider models = %#v", listBody.Models)
+	}
+
+	all := httptest.NewRecorder()
+	s.handleModelListAll(all, httptest.NewRequest(http.MethodGet, "/api/models/all", nil))
+	var allBody struct {
+		Models []struct {
+			ID       string `json:"id"`
+			Provider string `json:"provider"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(all.Body.Bytes(), &allBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(allBody.Models) != 1 || allBody.Models[0].ID != "header-model" || allBody.Models[0].Provider != "header-gateway" {
+		t.Fatalf("all provider models = %#v", allBody.Models)
 	}
 }
