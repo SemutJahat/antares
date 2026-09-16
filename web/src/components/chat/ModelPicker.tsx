@@ -114,6 +114,10 @@ export function ModelPicker({
         d ? { ...d, active: { model: m.id, provider: m.provider } } : d,
       );
       onModelChange?.(`${m.provider}/${m.id}`);
+      // Nudge subscribers (StatusPill, other poll-driven widgets) to refresh
+      // instead of waiting for their next polling tick — the model just
+      // changed and everything derived from it should update at once.
+      window.dispatchEvent(new CustomEvent('antares:model-changed'));
       setOpen(false);
       setQuery("");
     } catch (e) {

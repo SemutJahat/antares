@@ -129,21 +129,26 @@ are written to `~/.antares/logs/daemon.log`.
 
 ### Accessing it from another machine
 
-The production binary binds `127.0.0.1` by default. Change `server.host` to
-`0.0.0.0` (or a specific interface) to reach it from elsewhere; a non-loopback
-bind requires `server.auth_token`, a dashboard password, or an explicit
-`server.auth_disabled: true`. Vite also binds loopback in dev; set `HOST=0.0.0.0`
-to expose it on the network.
+The production binary binds `127.0.0.1` by default. Inside a container the
+first boot seeds `server.host: 0.0.0.0` into `config.yaml` once so `docker
+run -p 8787:8787` and Kubernetes port-forwards reach it out of the box;
+later boots read the stored value verbatim so your edits stick. To expose
+the binary elsewhere, edit `server.host` in `config.yaml` or export
+`ANTARES_HOST` before starting. `ANTARES_HOST` is a per-process override
+applied on every load — it wins for the current run but is **not** written
+to disk, so unsetting it restores the stored value on the next boot. Vite
+also binds loopback in dev; set `HOST=0.0.0.0` to expose it on the LAN.
 
 ```
-http://<tailscale-ip>:8787     # production binary, after setting server.host
+http://<tailscale-ip>:8787     # production binary, after editing server.host
+ANTARES_HOST=0.0.0.0 antares   # one-off exposure via env var; config.yaml is not changed
 HOST=0.0.0.0 make dev-web      # dev, exposed on the LAN
 ```
 
-Antares refuses to bind a non-loopback address unless `server.auth_token` is
-set, a dashboard password is configured, or `server.auth_disabled: true` is
-set explicitly — the default `127.0.0.1` binding leaves the dashboard open,
-which is right on your own machine and safe behind a private network.
+A non-loopback bind still requires `server.auth_token`, a dashboard password,
+or an explicit `server.auth_disabled: true` — Antares refuses to start
+otherwise. The loopback default leaves the dashboard open, which is right on
+your own machine and safe behind a private network.
 
 ---
 

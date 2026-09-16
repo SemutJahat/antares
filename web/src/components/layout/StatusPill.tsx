@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { CheckCircle, WarningCircle, XCircle } from '@phosphor-icons/react'
 import { usePoll } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
@@ -18,7 +19,16 @@ export interface StatusResponse {
 /** Compact backend health indicator shown in the sidebar. */
 export function StatusPill({ className }: { className?: string }) {
   const { t } = useI18n()
-  const { data, loading, error } = usePoll<StatusResponse>('/status', 10000)
+  const { data, loading, error, reload } = usePoll<StatusResponse>('/status', 10000)
+
+  // Refresh immediately when the model changes — the composer's ModelPicker
+  // fires 'antares:model-changed' after a successful /model/set, so the
+  // "Connected · <model>" label updates within a frame instead of waiting
+  // up to 10 s for the next poll tick.
+  useEffect(() => {
+    window.addEventListener('antares:model-changed', reload)
+    return () => window.removeEventListener('antares:model-changed', reload)
+  }, [reload])
 
   if (loading && !data) {
     return <Skeleton className={cn('h-9 w-full rounded-[var(--radius-sm)]', className)} />

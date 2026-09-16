@@ -11,6 +11,7 @@ import (
 
 	"github.com/enowdev/antares/internal/config"
 	"github.com/enowdev/antares/internal/llm"
+	"github.com/enowdev/antares/internal/providers"
 	"github.com/enowdev/antares/internal/tools"
 )
 
@@ -156,15 +157,16 @@ func (s *Server) handleModelOptions(w http.ResponseWriter, r *http.Request) {
 		BaseURL string `json:"base_url"`
 		Active  bool   `json:"active"`
 		// Setup metadata, so the connect form can render the right fields.
-		Hint            string `json:"hint,omitempty"`
-		KeyHint         string `json:"key_hint,omitempty"`
-		KeyURL          string `json:"key_url,omitempty"`
-		KeyLabel        string `json:"key_label,omitempty"`
-		Note            string `json:"note,omitempty"`
-		NeedsRegion     bool   `json:"needs_region,omitempty"`
-		NeedsAPIVersion bool   `json:"needs_api_version,omitempty"`
-		NeedsBaseURL    bool   `json:"needs_base_url,omitempty"`
-		TimeoutSecs     int    `json:"timeout_seconds,omitempty"`
+		Hint            string            `json:"hint,omitempty"`
+		KeyHint         string            `json:"key_hint,omitempty"`
+		KeyURL          string            `json:"key_url,omitempty"`
+		KeyLabel        string            `json:"key_label,omitempty"`
+		Note            string            `json:"note,omitempty"`
+		NeedsRegion     bool              `json:"needs_region,omitempty"`
+		NeedsAPIVersion bool              `json:"needs_api_version,omitempty"`
+		NeedsBaseURL    bool              `json:"needs_base_url,omitempty"`
+		TimeoutSecs     int               `json:"timeout_seconds,omitempty"`
+		Headers         map[string]string `json:"headers,omitempty"`
 		// Custom marks a user-defined provider. Customs always group under
 		// "API key" — even a localhost endpoint is a configured service, not
 		// one of the built-in local runtimes.
@@ -177,6 +179,7 @@ func (s *Server) handleModelOptions(w http.ResponseWriter, r *http.Request) {
 	// installations may still use that id for their real custom provider.
 	seen := map[string]bool{}
 	providerList := make([]providerInfo, 0)
+	exposeHeaders := cfg.Server.DashboardLocked() || s.bearerAuthorizedOrQuery(r)
 	for _, sp := range setupProviderCatalogue(cfg) {
 		p := cfg.Providers[sp.ID]
 		if sp.Custom && !legacyCustomProviderInUse(cfg, p) {
@@ -188,14 +191,18 @@ func (s *Server) handleModelOptions(w http.ResponseWriter, r *http.Request) {
 			label = firstNonEmpty(p.Label, sp.Label)
 			kind = firstNonEmpty(p.Kind, sp.Kind)
 		}
-		providerList = append(providerList, providerInfo{
+		info := providerInfo{
 			ID: sp.ID, Label: label, Kind: kind,
 			Enabled: p.Enabled, HasKey: p.APIKey != "", Local: sp.Local,
 			BaseURL: firstNonEmpty(p.BaseURL, sp.BaseURL), Active: sp.ID == cfg.Model.Provider,
 			Hint: sp.Hint, KeyHint: sp.KeyHint, KeyURL: sp.KeyURL, KeyLabel: sp.KeyLabel,
 			Note: sp.Note, NeedsRegion: sp.NeedsRegion, NeedsAPIVersion: sp.NeedsAPIVersion,
 			NeedsBaseURL: sp.NeedsBaseURL, TimeoutSecs: p.TimeoutSecs, Custom: sp.Custom,
-		})
+		}
+		if sp.Custom && exposeHeaders {
+			info.Headers = p.Headers
+		}
+		providerList = append(providerList, info)
 		seen[sp.ID] = true
 	}
 	names := make([]string, 0, len(cfg.Providers))
@@ -207,12 +214,16 @@ func (s *Server) handleModelOptions(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(names)
 	for _, name := range names {
 		p := cfg.Providers[name]
-		providerList = append(providerList, providerInfo{
+		info := providerInfo{
 			ID: name, Label: firstNonEmpty(p.Label, name), Kind: p.Kind, Enabled: p.Enabled,
 			HasKey: p.APIKey != "", BaseURL: p.BaseURL,
 			Active: name == cfg.Model.Provider, TimeoutSecs: p.TimeoutSecs,
 			Custom: true, NeedsBaseURL: true,
-		})
+		}
+		if exposeHeaders {
+			info.Headers = p.Headers
+		}
+		providerList = append(providerList, info)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -241,7 +252,7 @@ func (s *Server) handleModelList(w http.ResponseWriter, r *http.Request) {
 	// Calling a provider we know has no credential just turns a known state
 	// into an opaque 401. Report the missing key instead.
 	id, p := cfg.ResolveProvider(provider)
-	if p.APIKey == "" && !isLocalEndpoint(p.BaseURL) {
+	if p.APIKey == "" && !isLocalEndpoint(p.BaseURL) && !customProviderHasHeaders(cfg, id, p) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"models": []any{}, "needs_key": true, "provider": id,
 		})
@@ -262,6 +273,9 @@ func (s *Server) handleModelList(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
+	for i := range models {
+		models[i] = applyUserOverride(p, enrichModelInfo(id, models[i], p.Kind))
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": models})
 }
 
@@ -276,7 +290,8 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := s.config()
 
-	// Which providers are worth calling: a stored key, a set key-env, or local.
+	// Which providers are worth calling: a stored key, a set key-env, local, or
+	// a configured custom provider with explicit request headers.
 	type target struct {
 		id, label string
 	}
@@ -288,7 +303,7 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 		}
 		p := cfg.Providers[id]
 		keyed := p.APIKey != "" || (p.APIKeyEnv != "" && os.Getenv(p.APIKeyEnv) != "")
-		if keyed || isLocalEndpoint(p.BaseURL) {
+		if keyed || isLocalEndpoint(p.BaseURL) || customProviderHasHeaders(cfg, id, p) {
 			targets = append(targets, target{id: id, label: firstNonEmpty(p.Label, label, id)})
 			seen[id] = true
 		}
@@ -330,6 +345,7 @@ func (s *Server) handleModelListAll(w http.ResponseWriter, r *http.Request) {
 			}
 			p := cfg.Providers[t.id]
 			for _, m := range list {
+				m = applyUserOverride(p, enrichModelInfo(t.id, m, p.Kind))
 				m = withOfficialReasoning(p.Kind, p.BaseURL, m)
 				models = append(models, row{ModelInfo: m, Provider: t.id, ProviderLabel: t.label})
 			}
@@ -359,6 +375,74 @@ func withOfficialReasoning(kind, baseURL string, m llm.ModelInfo) llm.ModelInfo 
 	}
 	m.Reasoning = true
 	m.ReasoningCap = &cap
+	return m
+}
+
+// enrichModelInfo fills in llm.ModelInfo fields that the provider's own
+// /models endpoint left blank (context window, pricing, capability flags) by
+// consulting the bundled models.dev snapshot. Provider-reported values win
+// when they are non-zero, so a live API is always trusted over a stale
+// snapshot. Called before withOfficialReasoning so the reasoning ladder
+// layer can still overwrite the capability flag for official providers.
+func enrichModelInfo(providerID string, m llm.ModelInfo, kind string) llm.ModelInfo {
+	meta, ok := providers.MetaByProvider(providerID, m.ID)
+	if !ok {
+		// OpenAI-compatible proxies (EnxAPI, custom endpoints, LiteLLM, …)
+		// re-serve official models under their real ids. When the strict
+		// provider/id lookup misses, fall back to searching every provider
+		// so the picker still shows correct context/cost — but only for
+		// these proxies, so a first-party provider that genuinely does not
+		// carry a model never inherits some unrelated entry.
+		if kind == "openai-compatible" || kind == "custom" {
+			meta, ok = providers.MetaByAnyProvider(m.ID)
+		}
+	}
+	if !ok {
+		return m
+	}
+	if m.Name == "" || m.Name == m.ID {
+		if meta.Name != "" {
+			m.Name = meta.Name
+		}
+	}
+	if m.ContextWindow == 0 && meta.ContextWindow > 0 {
+		m.ContextWindow = meta.ContextWindow
+	}
+	if m.MaxOutput == 0 && meta.MaxOutput > 0 {
+		m.MaxOutput = meta.MaxOutput
+	}
+	if m.InputCost == 0 && meta.Cost.Input > 0 {
+		m.InputCost = meta.Cost.Input
+	}
+	if m.OutputCost == 0 && meta.Cost.Output > 0 {
+		m.OutputCost = meta.Cost.Output
+	}
+	// Vision is a strict input-modality claim ("this model reads image
+	// bytes"). meta.Attachment is broader — it flips on for PDF/audio/video
+	// too — so folding it into Vision would mark an audio-only model as
+	// vision-capable and let the picker feed it images it will reject.
+	if !m.Vision && meta.Vision {
+		m.Vision = true
+	}
+	if !m.Tools && meta.ToolCall {
+		m.Tools = true
+	}
+	if !m.Reasoning && meta.Reasoning {
+		m.Reasoning = true
+	}
+	return m
+}
+
+// applyUserOverride swaps in fields the user pinned in cfg.Providers[id].ModelMeta.
+// Called after enrichModelInfo so the override always wins over live+generated.
+func applyUserOverride(p config.Provider, m llm.ModelInfo) llm.ModelInfo {
+	override, ok := p.ModelMeta[m.ID]
+	if !ok {
+		return m
+	}
+	if override.ContextWindow > 0 {
+		m.ContextWindow = override.ContextWindow
+	}
 	return m
 }
 

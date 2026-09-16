@@ -218,6 +218,13 @@ func bootstrap(ctx context.Context) (*runtimeServices, error) {
 	if err := logx.Setup(cfg.Logging.Level, cfg.Logging.File, cfg.Logging.JSON); err != nil {
 		return nil, fmt.Errorf("setting up logging: %w", err)
 	}
+	// Kick off the background models.dev refresh. The bundled snapshot
+	// answers every lookup immediately (offline, first-run, corporate
+	// firewall); this pulls a fresh copy in the background and caches it
+	// under $XDG_CACHE_HOME/antares/models.json for the next boot. Set
+	// ANTARES_DISABLE_MODELS_FETCH=1 to skip on airgapped hosts.
+	providers.StartRefresh(ctx)
+
 	// Don't create the default workspace before the wizard has run — a fresh
 	// install shouldn't leave ~/antares-workspace behind if setup is abandoned.
 	if !needsSetup(cfg) {

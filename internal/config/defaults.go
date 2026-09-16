@@ -1,6 +1,10 @@
 package config
 
-import "path/filepath"
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+)
 
 // Default returns a fully populated configuration. Every field the dashboard
 // can edit has a sensible value here so the UI never renders a blank form.
@@ -50,9 +54,11 @@ func Default() *Config {
 			MaxConns: 8, Busy: 5000, WAL: true,
 		},
 		Server: Server{
-			Host: "0.0.0.0", Port: 8787,
-			// Same-origin is the safe default. Cross-origin access must be
-			// explicitly configured by the operator.
+			Host: defaultHost(), Port: 8787,
+			// defaultHost() seeds loopback on bare metal, wildcard in a
+			// container. ANTARES_HOST is a per-load runtime override
+			// applied in applyEnv; it never touches the persisted seed.
+			// CORS starts same-origin only.
 			CORSOrigins: []string{},
 		},
 		Agent: Agent{
@@ -143,4 +149,42 @@ func Default() *Config {
 			IMAPHost: "imap.gmail.com", IMAPPort: 993,
 		},
 	}
+}
+
+// defaultHost picks the seed for a fresh config.yaml. It does not read
+// ANTARES_HOST — that env var is a runtime override applied by applyEnv, so
+// a transient export never gets baked into the persisted file.
+func defaultHost() string {
+	if inContainer() {
+		return "0.0.0.0"
+	}
+	return "127.0.0.1"
+}
+
+// containerProbe is the seam tests replace to simulate running inside a
+// container without needing Docker. Production code calls the real probe.
+var containerProbe = detectContainer
+
+// inContainer reports whether Antares is running inside a container. It goes
+// through the swappable containerProbe so tests can stub the answer.
+func inContainer() bool { return containerProbe() }
+
+// detectContainer looks at filesystem markers Docker, Podman, and
+// Kubernetes leave in the container image. Any failure means "not detected"
+// — the loopback fallback is the safe answer if we cannot tell.
+func detectContainer() bool {
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	if _, err := os.Stat("/run/.containerenv"); err == nil {
+		return true
+	}
+	if b, err := os.ReadFile("/proc/1/cgroup"); err == nil {
+		if bytes.Contains(b, []byte("docker")) ||
+			bytes.Contains(b, []byte("kubepods")) ||
+			bytes.Contains(b, []byte("containerd")) {
+			return true
+		}
+	}
+	return false
 }

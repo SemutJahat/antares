@@ -34,8 +34,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	// Provider readiness is a config check, not a live call: the status pill
 	// polls every ten seconds and must not bill the user for pings.
-	_, provider := cfg.ResolveProvider(cfg.Model.Provider)
-	ready := cfg.Model.Default != "" && (provider.APIKey != "" || isLocalEndpoint(provider.BaseURL))
+	ready := !NeedsSetup(cfg)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":              true,

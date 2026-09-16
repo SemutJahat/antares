@@ -1,0 +1,3 @@
+# Generated files — collapse in GitHub diffs by default and skip from
+# linguist language stats. Regenerate with `make sync-models`.
+internal/providers/models_generated.json linguist-generated=true

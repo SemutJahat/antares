@@ -12,8 +12,10 @@ import {
   Warning,
 } from '@phosphor-icons/react'
 import { get, post } from '@/lib/api'
+import { parseProviderHeaders } from '@/lib/providerHeaders'
 import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
+import { ProviderHeadersField } from '@/components/providers/ProviderHeadersField'
 import { Button } from '@/components/ui/button'
 import {
   Badge,
@@ -76,6 +78,7 @@ export default function SetupPage() {
   const [providerName, setProviderName] = useState('')
   const [baseURL, setBaseURL] = useState('')
   const [apiKey, setApiKey] = useState('')
+  const [headersText, setHeadersText] = useState('')
   const [revealKey, setRevealKey] = useState(false)
   const [testing, setTesting] = useState(false)
   const [test, setTest] = useState<TestResult>()
@@ -129,6 +132,14 @@ export default function SetupPage() {
   }
 
   const runTest = async () => {
+    let headers: Record<string, string> | undefined
+    try {
+      headers = providerId === 'custom' ? parseProviderHeaders(headersText) : undefined
+    } catch {
+      setError(t('providers.headersInvalid'))
+      return
+    }
+
     setTesting(true)
     setTest(undefined)
     setError(undefined)
@@ -137,6 +148,7 @@ export default function SetupPage() {
         provider: providerId,
         base_url: baseURL || provider?.base_url || '',
         api_key: apiKey,
+        ...(providerId === 'custom' ? { headers } : {}),
       })
       setTest(r)
       if (r.ok) {
@@ -152,6 +164,14 @@ export default function SetupPage() {
   }
 
   const finish = async () => {
+    let headers: Record<string, string> | undefined
+    try {
+      headers = providerId === 'custom' ? parseProviderHeaders(headersText) : undefined
+    } catch {
+      setError(t('providers.headersInvalid'))
+      return
+    }
+
     setSaving(true)
     setError(undefined)
     try {
@@ -160,6 +180,7 @@ export default function SetupPage() {
         name: providerName,
         base_url: baseURL || provider?.base_url || '',
         api_key: apiKey,
+        ...(providerId === 'custom' ? { headers } : {}),
         model,
         workspace,
         database: {
@@ -270,6 +291,7 @@ export default function SetupPage() {
               />
             </div>
           ) : null}
+          {providerId === 'custom' ? <ProviderHeadersField id="setup-headers" value={headersText} onChange={setHeadersText} /> : null}
 
           <StepNav
             onNext={goNext}
