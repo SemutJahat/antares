@@ -2,11 +2,15 @@ module github.com/enowdev/antares
 
 go 1.26.3
 
+// coder/hnsw#24 removes Unix-only renameio; pin the reviewed Windows fix.
+replace github.com/coder/hnsw => github.com/tradik/hnsw v0.6.2-0.20260824091751-ad04fee59f41
+
 require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/glamour v1.0.0
 	github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
+	github.com/chromedp/chromedp v0.16.0
 	github.com/coder/hnsw v0.6.2-0.20260622133054-36cab6028fed
 	github.com/emersion/go-imap v1.2.1
 	github.com/enowdev/cloak-go v0.2.2-0.20260802105213-db0721c9e2e8
@@ -35,7 +39,6 @@ require (
 	github.com/charmbracelet/x/term v0.2.2 // indirect
 	github.com/chewxy/math32 v1.10.1 // indirect
 	github.com/chromedp/cdproto v0.0.0-20260719223732-95f6af754cfe // indirect
-	github.com/chromedp/chromedp v0.16.0 // indirect
 	github.com/chromedp/sysutil v1.1.0 // indirect
 	github.com/clipperhouse/displaywidth v0.9.0 // indirect
 	github.com/clipperhouse/stringish v0.1.1 // indirect
@@ -48,7 +51,6 @@ require (
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/gobwas/ws v1.4.0 // indirect
-	github.com/google/renameio v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/css v1.0.1 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect

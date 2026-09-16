@@ -32,6 +32,13 @@ dashboard password, or an explicit `server.auth_disabled: true`).
 Go code is in `internal/`, one package per concern, described in
 [Architecture](architecture.md). The dashboard is in `web/`.
 
+The HNSW dependency is pinned through a `go.mod` replacement to the reviewed
+[Windows portability fix](https://github.com/coder/hnsw/pull/24). Upstream's
+`renameio` dependency prevents Windows builds even though Antares only uses
+the in-memory graph; vectors remain persisted in SQL. Keep the replacement
+until an upstream revision includes the fix, and cross-build both Windows
+architectures when updating it.
+
 ## Adding things
 
 **A tool** — implement the four-method interface in `internal/tools`, register
