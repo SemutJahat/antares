@@ -16,6 +16,12 @@ public enum RuntimePlan {
 public struct HealthResponse: Decodable, Sendable {
     public let ok: Bool
     public let version: String
+
+    /// Any 2xx /api/health decode means Antares is present; `ok` may be false when db ping fails.
+    public static func meansAntaresPresent(decodeSucceeded: Bool, ok: Bool = true) -> Bool {
+        _ = ok
+        return decodeSucceeded
+    }
 }
 
 public enum RuntimeSupervisorError: Error, LocalizedError {
@@ -81,7 +87,12 @@ public final class RuntimeSupervisor: @unchecked Sendable {
         case .spawned:
             guard let binary else { throw RuntimeSupervisorError.missingBinary }
             try spawn(binary: binary)
-            try await waitForHealth()
+            do {
+                try await waitForHealth()
+            } catch {
+                await stop()
+                throw error
+            }
         }
     }
 
@@ -103,7 +114,8 @@ public final class RuntimeSupervisor: @unchecked Sendable {
     }
 
     private func probeHealth() async -> Bool {
-        (try? await fetchHealth())?.ok == true
+        // Attach on any 2xx decode; ok:false is degraded Antares, not a port conflict.
+        HealthResponse.meansAntaresPresent(decodeSucceeded: (try? await fetchHealth()) != nil)
     }
 
     private func fetchHealth() async throws -> HealthResponse {
@@ -113,6 +125,12 @@ public final class RuntimeSupervisor: @unchecked Sendable {
     private func waitForHealth() async throws {
         let deadline = Date().addingTimeInterval(30)
         while Date() < deadline {
+            if process?.isRunning == false {
+                let detail = await stderrLog.lastLog
+                throw RuntimeSupervisorError.spawnFailed(
+                    detail.isEmpty ? "Backend process exited before becoming healthy" : detail
+                )
+            }
             if await probeHealth() { return }
             try await Task.sleep(for: .milliseconds(200))
         }
