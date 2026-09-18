@@ -24,4 +24,26 @@ final class SSEClientTests: XCTestCase {
         try SSEParser.parse(Data(raw.utf8)) { _ in count += 1 }
         XCTAssertEqual(count, 1)
     }
+
+    func testMalformedJSONKeepsStreamAlive() throws {
+        let raw = "data: not-json\n\ndata: {\"ok\":true}\n\n"
+        var events: [[String: String]] = []
+        var errors: [String] = []
+        try SSEParser.parse(Data(raw.utf8), onEvent: { json in
+            events.append(json)
+        }, onParseError: { raw, _ in
+            errors.append(raw)
+        })
+        XCTAssertEqual(events, [["ok": "true"]])
+        XCTAssertEqual(errors, ["not-json"])
+    }
+
+    func testStripsSingleLeadingSpaceAfterDataColon() throws {
+        let raw = "data: \"spaced\"\n\ndata:\"tight\"\n\n"
+        var events: [[String: String]] = []
+        try SSEParser.parse(Data(raw.utf8)) { json in
+            events.append(json)
+        }
+        XCTAssertEqual(events, [["value": "spaced"], ["value": "tight"]])
+    }
 }
