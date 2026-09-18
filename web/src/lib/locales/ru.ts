@@ -209,6 +209,10 @@ const ru: Dict = {
   'theme.light': 'Светлая тема',
   'theme.dark': 'Тёмная тема',
   'theme.toggle': 'Сменить тему',
+  'theme.claude': 'Claude',
+  'theme.facebook': 'Facebook',
+  'theme.pinterest': 'Pinterest',
+  'theme.supabase': 'Supabase',
 
   'status.connected': 'Подключено',
   'status.offline': 'Бэкенд недоступен',
@@ -611,6 +615,8 @@ const ru: Dict = {
 
   'config.essentials': 'Основное',
   'config.essentialsHint': 'Немногие настройки, от которых зависит, заработает ли Antares вообще. У остального разумные значения по умолчанию.',
+  'config.appearance': 'Оформление',
+  'config.appearanceHint': 'Сохраняется в этом браузере. Светлая и тёмная темы по-прежнему на боковой панели.',
   'config.yamlSection': 'YAML',
   'config.showAdvanced': 'Показать дополнительные настройки ({n})',
   'config.hideAdvanced': 'Скрыть дополнительные настройки',
@@ -668,7 +674,7 @@ const ru: Dict = {
   'system.workspace': 'Рабочий каталог',
   'system.configPath': 'Конфигурация',
   'system.down': 'Бэкенд не отвечает',
-  'system.downDesc': 'Убедитесь, что процесс antares serve запущен.',
+  'system.downDesc': 'Убедитесь, что процесс antares запущен.',
 
   'error.pageTitle': 'На этой странице произошла ошибка',
   'error.pageDesc': 'Остальная часть Antares работает. Повторите попытку или перейдите на другую страницу.',

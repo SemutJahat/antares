@@ -2,9 +2,16 @@ import { describe, expect, test } from 'bun:test'
 import {
   appendSeg,
   hydrate,
+  lastUserMessageIndex,
   mergeHydratedWithLocalErrors,
   normalizeErrorPayload,
   pushToolSeg,
+  shouldCancelEditOnPointer,
+  splitTranscriptTurns,
+  shouldFadeStickyPrompt,
+  promptLineCount,
+  nextPromptLineCount,
+  stickyPromptClipClass,
   updateToolSeg,
 } from './chatTranscript.ts'
 
@@ -284,5 +291,80 @@ describe('mergeHydratedWithLocalErrors', () => {
     const hydrated = [{ id: 'srv_1', role: 'user', content: 'earlier' }]
     const merged = mergeHydratedWithLocalErrors(hydrated, [...hydrated, user, err])
     expect(merged.map((m) => m.id)).toEqual(['srv_1', 'local_u', 'local_err'])
+  })
+})
+
+describe('last user pin', () => {
+  test('lastUserMessageIndex finds the most recent user turn', () => {
+    expect(lastUserMessageIndex([])).toBe(-1)
+    expect(lastUserMessageIndex([{ role: 'assistant' }])).toBe(-1)
+    expect(
+      lastUserMessageIndex([
+        { role: 'user' },
+        { role: 'assistant' },
+        { role: 'user' },
+        { role: 'assistant' },
+      ]),
+    ).toBe(2)
+  })
+
+  test('splitTranscriptTurns groups every user bubble with the replies that follow it', () => {
+    expect(splitTranscriptTurns([])).toEqual([])
+    expect(splitTranscriptTurns([{ id: 'a', role: 'assistant' }])).toEqual([
+      { user: null, replies: [{ id: 'a', role: 'assistant' }] },
+    ])
+    const u = { id: 'u', role: 'user' }
+    expect(splitTranscriptTurns([u])).toEqual([{ user: u, replies: [] }])
+    const u0 = { id: 'u0', role: 'user' }
+    const a0 = { id: 'a0', role: 'assistant' }
+    const u1 = { id: 'u1', role: 'user' }
+    const a1 = { id: 'a1', role: 'assistant' }
+    const a2 = { id: 'a2', role: 'assistant' }
+    const sys = { id: 's', role: 'system' }
+    expect(splitTranscriptTurns([a0, u0, sys, u1, a1, a2])).toEqual([
+      { user: null, replies: [a0] },
+      { user: u0, replies: [sys] },
+      { user: u1, replies: [a1, a2] },
+    ])
+  })
+
+  test('nextPromptLineCount keeps the last wrap count when the node unmounts for edit', () => {
+    expect(nextPromptLineCount(3, 0, 28)).toBe(3)
+    expect(nextPromptLineCount(3, 56, 28)).toBe(2)
+    expect(nextPromptLineCount(1, 84, 28)).toBe(3)
+  })
+
+  test('promptLineCount treats a single line as 1 even when shorter than the line-height', () => {
+    expect(promptLineCount(28, 28)).toBe(1)
+    expect(promptLineCount(20, 28)).toBe(1)
+    expect(promptLineCount(56, 28)).toBe(2)
+    expect(promptLineCount(0, 28)).toBe(1)
+    expect(promptLineCount(40, 0)).toBe(1)
+  })
+
+  test('shouldFadeStickyPrompt only when docked and the prompt wraps past one line', () => {
+    expect(shouldFadeStickyPrompt(false, 4)).toBe(false)
+    expect(shouldFadeStickyPrompt(true, 1)).toBe(false)
+    expect(shouldFadeStickyPrompt(true, 2)).toBe(true)
+    expect(shouldFadeStickyPrompt(true, 3)).toBe(true)
+  })
+
+  test('stickyPromptClipClass animates max-height and never uses an outer mask', () => {
+    const open = stickyPromptClipClass(false)
+    const clip = stickyPromptClipClass(true)
+    expect(open).toContain('max-h-[80rem]')
+    expect(open).toContain('duration-200')
+    expect(clip).toContain('max-h-[3.55rem]')
+    expect(clip).toContain('overflow-hidden')
+    expect(clip).not.toContain('mask-image')
+  })
+
+  test('shouldCancelEditOnPointer leaves edit only when the click is outside the editor', () => {
+    const inside = { id: 'in' }
+    const editor = { contains: (n) => n === inside }
+    expect(shouldCancelEditOnPointer(inside, editor)).toBe(false)
+    expect(shouldCancelEditOnPointer({ id: 'out' }, editor)).toBe(true)
+    expect(shouldCancelEditOnPointer(null, editor)).toBe(true)
+    expect(shouldCancelEditOnPointer(inside, null)).toBe(true)
   })
 })
