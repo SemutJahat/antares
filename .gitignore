@@ -12,6 +12,10 @@ node_modules/
 web/dist/
 internal/server/dist/*
 
+# SwiftPM
+macos/**/.build/
+macos/**/.swiftpm/
+
 # Dev-only UI prototypes (not shipped). See web/src/App.tsx SampleRoutes.
 web/src/sample/
 
