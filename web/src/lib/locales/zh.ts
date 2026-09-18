@@ -209,6 +209,10 @@ const zh: Dict = {
   'theme.light': '浅色模式',
   'theme.dark': '深色模式',
   'theme.toggle': '切换主题',
+  'theme.claude': 'Claude',
+  'theme.facebook': 'Facebook',
+  'theme.pinterest': 'Pinterest',
+  'theme.supabase': 'Supabase',
 
   'status.connected': '已连接',
   'status.offline': '后端离线',
@@ -608,6 +612,8 @@ const zh: Dict = {
 
   'config.essentials': '核心设置',
   'config.essentialsHint': '决定 Antares 能否运行的少数几项。其余都有合理的默认值。',
+  'config.appearance': '外观',
+  'config.appearanceHint': '保存在此浏览器中。浅色和深色仍在侧栏切换。',
   'config.yamlSection': 'YAML',
   'config.showAdvanced': '显示 {n} 项高级设置',
   'config.hideAdvanced': '隐藏高级设置',
@@ -665,7 +671,7 @@ const zh: Dict = {
   'system.workspace': '工作区',
   'system.configPath': '配置文件',
   'system.down': '后端无响应',
-  'system.downDesc': '请确认 antares serve 进程正在运行。',
+  'system.downDesc': '请确认 antares 进程正在运行。',
 
   'error.pageTitle': '此页面出错了',
   'error.pageDesc': 'Antares 的其余部分仍在运行。请重试，或切换到其他页面。',

@@ -209,6 +209,10 @@ const ja: Dict = {
   'theme.light': 'ライトモード',
   'theme.dark': 'ダークモード',
   'theme.toggle': 'テーマ切替',
+  'theme.claude': 'Claude',
+  'theme.facebook': 'Facebook',
+  'theme.pinterest': 'Pinterest',
+  'theme.supabase': 'Supabase',
 
   'status.connected': '接続済み',
   'status.offline': 'バックエンド停止',
@@ -610,6 +614,8 @@ const ja: Dict = {
 
   'config.essentials': '基本設定',
   'config.essentialsHint': 'Antares が動くかどうかを決める最小限の設定です。他は妥当な初期値が入っています。',
+  'config.appearance': '外観',
+  'config.appearanceHint': 'このブラウザに保存されます。ライトとダークはサイドバーのままです。',
   'config.yamlSection': 'YAML',
   'config.showAdvanced': '詳細設定 {n} 件を表示',
   'config.hideAdvanced': '詳細設定を隠す',
@@ -667,7 +673,7 @@ const ja: Dict = {
   'system.workspace': 'ワークスペース',
   'system.configPath': '設定ファイル',
   'system.down': 'バックエンドが応答しません',
-  'system.downDesc': 'antares serve プロセスが動いているか確認してください。',
+  'system.downDesc': 'antares プロセスが動いているか確認してください。',
 
   'error.pageTitle': 'このページでエラーが発生しました',
   'error.pageDesc': 'Antares の他の部分は動作しています。再試行するか、別のページへ移動してください。',

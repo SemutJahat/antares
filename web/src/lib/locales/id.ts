@@ -219,6 +219,10 @@ const id: Dict = {
   'theme.light': 'Mode terang',
   'theme.dark': 'Mode gelap',
   'theme.toggle': 'Ganti tema',
+  'theme.claude': 'Claude',
+  'theme.facebook': 'Facebook',
+  'theme.pinterest': 'Pinterest',
+  'theme.supabase': 'Supabase',
 
   'status.connected': 'Terhubung',
   'status.offline': 'Backend mati',
@@ -783,6 +787,8 @@ const id: Dict = {
 
   'config.essentials': 'Yang penting',
   'config.essentialsHint': 'Segelintir pengaturan yang menentukan Antares bisa jalan atau tidak. Sisanya sudah punya default yang masuk akal.',
+  'config.appearance': 'Tampilan',
+  'config.appearanceHint': 'Disimpan di browser ini. Mode terang dan gelap tetap di sidebar.',
   'config.yamlSection': 'YAML',
   'config.showAdvanced': 'Tampilkan {n} pengaturan lanjutan',
   'config.hideAdvanced': 'Sembunyikan pengaturan lanjutan',
@@ -855,7 +861,7 @@ const id: Dict = {
   'system.workspace': 'Workspace',
   'system.configPath': 'Konfigurasi',
   'system.down': 'Backend tidak merespons',
-  'system.downDesc': 'Pastikan proses antares serve sedang berjalan.',
+  'system.downDesc': 'Pastikan proses antares sedang berjalan.',
 
   'error.pageTitle': 'Halaman ini bermasalah',
   'error.pageDesc': 'Bagian lain Antares tetap berjalan. Coba lagi, atau pindah halaman.',

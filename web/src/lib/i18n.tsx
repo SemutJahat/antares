@@ -239,6 +239,10 @@ const en = {
   'theme.light': 'Light mode',
   'theme.dark': 'Dark mode',
   'theme.toggle': 'Toggle theme',
+  'theme.claude': 'Claude',
+  'theme.facebook': 'Facebook',
+  'theme.pinterest': 'Pinterest',
+  'theme.supabase': 'Supabase',
 
   'status.connected': 'Connected',
   'status.offline': 'Backend offline',
@@ -852,6 +856,8 @@ const en = {
 
   'config.essentials': 'Essentials',
   'config.essentialsHint': 'The handful of settings that decide whether Antares works at all. Everything else has a sensible default.',
+  'config.appearance': 'Appearance',
+  'config.appearanceHint': 'Stored in this browser. Light and dark stay on the sidebar.',
   'config.yamlSection': 'YAML',
   'config.showAdvanced': 'Show {n} advanced settings',
   'config.hideAdvanced': 'Hide advanced settings',
@@ -987,7 +993,7 @@ const en = {
   'system.workspace': 'Workspace',
   'system.configPath': 'Config',
   'system.down': 'Backend is not responding',
-  'system.downDesc': 'Make sure the antares serve process is running.',
+  'system.downDesc': 'Make sure the antares process is running.',
 
   'error.pageTitle': 'This page hit an error',
   'error.pageDesc': 'The rest of Antares is still running. Try again, or switch pages.',

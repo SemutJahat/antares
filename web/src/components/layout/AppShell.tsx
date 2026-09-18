@@ -2,8 +2,9 @@ import { Suspense, useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { List, Moon, Sun, Translate, X } from '@phosphor-icons/react'
 import { cn } from '@/lib/utils'
-import { useLocalStorage, useMediaQuery } from '@/lib/hooks'
+import { useMediaQuery } from '@/lib/hooks'
 import { LANGUAGES, useI18n } from '@/lib/i18n'
+import { useTheme } from '@/lib/theme-provider'
 import { NAV_LABELS, PRIMARY_ROUTES, ROUTES, routeFor } from '@/lib/routes'
 import { Button } from '@/components/ui/button'
 import { TooltipProvider } from '@/components/ui/primitives'
@@ -12,16 +13,6 @@ import { UpdateBanner } from '@/components/layout/UpdateBanner'
 import { PageChromeProvider, usePageChrome } from '@/components/layout/PageChrome'
 import { ErrorBoundary } from '@/components/layout/ErrorBoundary'
 import { SkeletonList, SkeletonStats } from '@/components/ui/skeleton'
-
-/** Applies the persisted theme to <html>. */
-function useTheme() {
-  const [theme, setTheme] = useLocalStorage<'dark' | 'light'>('antares.theme', 'dark')
-  useEffect(() => {
-    document.documentElement.classList.toggle('dark', theme === 'dark')
-    document.documentElement.style.colorScheme = theme
-  }, [theme])
-  return { theme, setTheme }
-}
 
 function AntaresMark({ className }: { className?: string }) {
   return (

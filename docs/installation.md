@@ -9,7 +9,7 @@ Works on **Linux**, **macOS**, and **Windows** (amd64 and arm64).
 
 One executable, `antares` — that is the whole CLI, with the dashboard embedded
 inside it. After install, every command works from anywhere on your PATH:
-`antares` (terminal UI), `antares serve` (API + dashboard), `antares setup`,
+`antares` (API + dashboard), `antares tui` (terminal UI), `antares setup`,
 `antares doctor`, and the rest.
 
 | OS | Installed to | PATH |

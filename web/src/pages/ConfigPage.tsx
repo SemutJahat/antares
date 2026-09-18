@@ -9,12 +9,15 @@ import {
   GoogleLogo,
   Lock,
   MagnifyingGlass,
+  Palette as PaletteIcon,
   Sparkle,
   Warning,
 } from '@phosphor-icons/react'
 import { post } from '@/lib/api'
 import { useApi } from '@/lib/hooks'
-import { useI18n } from '@/lib/i18n'
+import { useI18n, type MessageKey } from '@/lib/i18n'
+import { PALETTES, PALETTE_SWATCHES, type Palette } from '@/lib/theme'
+import { useTheme } from '@/lib/theme-provider'
 import { cn } from '@/lib/utils'
 import { usePageActions } from '@/components/layout/PageChrome'
 import { Button } from '@/components/ui/button'
@@ -55,7 +58,15 @@ interface ConfigResponse {
 }
 
 const ESSENTIALS = '__essentials'
+const APPEARANCE = '__appearance'
 const YAML = '__yaml'
+
+const PALETTE_LABEL: Record<Palette, MessageKey> = {
+  claude: 'theme.claude',
+  facebook: 'theme.facebook',
+  pinterest: 'theme.pinterest',
+  supabase: 'theme.supabase',
+}
 
 function readPath(obj: Record<string, unknown>, path: string): unknown {
   return path.split('.').reduce<unknown>((acc, key) => {
@@ -245,14 +256,7 @@ export default function ConfigPage() {
         />
       </div>
 
-      {loading && !data ? (
-        <div className="grid gap-5 lg:grid-cols-[13rem_1fr]">
-          <Skeleton className="hidden h-80 w-full rounded-[var(--radius-lg)] lg:block" />
-          <SkeletonList count={5} />
-        </div>
-      ) : !data ? (
-        <EmptyState title={t('config.loadFailed')} />
-      ) : searching ? (
+      {searching && data ? (
         // Search replaces the layout entirely: one flat list, group shown per row.
         <div className="space-y-3 lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:pr-1">
           <p className="text-xs text-muted-foreground">{t('config.matches', { n: results.length })}</p>
@@ -273,7 +277,13 @@ export default function ConfigPage() {
           />
 
           <div className="min-w-0 space-y-4 lg:h-full lg:overflow-y-auto lg:pb-6 lg:pr-1">
-            {section === YAML ? (
+            {section === APPEARANCE ? (
+              <AppearanceSection />
+            ) : loading && !data ? (
+              <SkeletonList count={5} />
+            ) : !data ? (
+              <EmptyState title={t('config.loadFailed')} />
+            ) : section === YAML ? (
               <Card>
                 <CardHeader>
                   <CardTitle>{t('config.editDirect')}</CardTitle>
@@ -383,6 +393,15 @@ function SectionRail({
       <nav className="hidden lg:block lg:h-full lg:overflow-y-auto lg:pb-6 lg:pr-1">
         <div className="space-y-0.5">
           {item(
+            APPEARANCE,
+            t('config.appearance'),
+            undefined,
+            <PaletteIcon
+              className="size-4 shrink-0"
+              weight={section === APPEARANCE ? 'fill' : 'regular'}
+            />,
+          )}
+          {item(
             ESSENTIALS,
             t('config.essentials'),
             dot(dirtyEssentials),
@@ -405,6 +424,7 @@ function SectionRail({
           className="h-10 w-full rounded-[var(--radius-sm)] border border-input bg-background px-3 text-sm"
           aria-label={t('config.title')}
         >
+          <option value={APPEARANCE}>{t('config.appearance')}</option>
           <option value={ESSENTIALS}>{t('config.essentials')}</option>
           {groups.map((g) => (
             <option key={g} value={g}>
@@ -416,6 +436,51 @@ function SectionRail({
         </select>
       </div>
     </>
+  )
+}
+
+function AppearanceSection() {
+  const { t } = useI18n()
+  const { theme, palette, setPalette } = useTheme()
+
+  return (
+    <div className="space-y-4">
+      <p className="text-xs leading-relaxed text-muted-foreground sm:text-sm">
+        {t('config.appearanceHint')}
+      </p>
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        {PALETTES.map((id) => {
+          const swatch = PALETTE_SWATCHES[id][theme]
+          const selected = palette === id
+          return (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setPalette(id)}
+              aria-pressed={selected}
+              className={cn(
+                'flex items-center gap-3 rounded-[var(--radius-lg)] border p-3 text-left transition-colors',
+                selected
+                  ? 'border-primary ring-2 ring-primary/40'
+                  : 'border-border hover:bg-accent/60',
+              )}
+            >
+              <span
+                className="size-10 shrink-0 overflow-hidden rounded-[var(--radius-sm)] border border-border"
+                style={{
+                  background: `linear-gradient(135deg, ${swatch.bg} 50%, ${swatch.accent} 50%)`,
+                }}
+                aria-hidden
+              />
+              <span className="min-w-0 flex-1 text-sm font-medium">{t(PALETTE_LABEL[id])}</span>
+              {selected ? (
+                <CheckCircle className="size-4 shrink-0 text-primary" weight="fill" />
+              ) : null}
+            </button>
+          )
+        })}
+      </div>
+    </div>
   )
 }
 
